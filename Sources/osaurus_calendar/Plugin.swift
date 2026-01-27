@@ -428,8 +428,13 @@ private var api: osr_plugin_api = {
     let manifest = """
       {
         "plugin_id": "osaurus.calendar",
-        "version": "0.1.0",
+        "name": "Calendar",
+        "version": "1.0.5",
         "description": "A calendar plugin for macOS Calendar.app integration",
+        "license": "MIT",
+        "authors": ["Osaurus"],
+        "min_macos": "13.0",
+        "min_osaurus": "0.5.0",
         "capabilities": {
           "tools": [
             {
