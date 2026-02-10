@@ -1,28 +1,63 @@
-import Cocoa
 import Foundation
 import XCTest
 
 final class AppleScriptTests: XCTestCase {
 
-  // MARK: - Helper to run AppleScript
+  // MARK: - Helper to run AppleScript via osascript process (matches plugin implementation)
 
-  private func runAppleScript(_ script: String) -> Result<String, Error> {
-    var error: NSDictionary?
-    let appleScript = NSAppleScript(source: script)
+  private func runAppleScript(_ script: String, timeout: TimeInterval = 15) -> Result<String, Error>
+  {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    process.arguments = ["-e", script]
 
-    guard let result = appleScript?.executeAndReturnError(&error) else {
-      if let error = error {
-        let message = error[NSAppleScript.errorMessage] as? String ?? "Unknown AppleScript error"
-        return .failure(
-          NSError(
-            domain: "AppleScriptTest", code: -1, userInfo: [NSLocalizedDescriptionKey: message]))
-      }
-      return .failure(
-        NSError(
-          domain: "AppleScriptTest", code: -2, userInfo: [NSLocalizedDescriptionKey: "No result"]))
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+
+    do {
+      try process.run()
+    } catch {
+      return .failure(error)
     }
 
-    return .success(result.stringValue ?? "")
+    let timer = DispatchSource.makeTimerSource(queue: .global())
+    timer.schedule(deadline: .now() + timeout)
+    timer.setEventHandler {
+      if process.isRunning { process.terminate() }
+    }
+    timer.resume()
+
+    process.waitUntilExit()
+    timer.cancel()
+
+    let timedOut = process.terminationReason == .uncaughtSignal
+
+    if timedOut {
+      return .failure(
+        NSError(
+          domain: "AppleScriptTest", code: -3,
+          userInfo: [
+            NSLocalizedDescriptionKey: "AppleScript timed out after \(Int(timeout)) seconds"
+          ]))
+    }
+
+    if process.terminationStatus != 0 {
+      let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+      let errMsg =
+        String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        ?? "Unknown AppleScript error"
+      return .failure(
+        NSError(
+          domain: "AppleScriptTest", code: Int(process.terminationStatus),
+          userInfo: [NSLocalizedDescriptionKey: errMsg]))
+    }
+
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let output =
+      String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return .success(output)
   }
 
   // MARK: - Basic AppleScript Execution Tests
@@ -254,6 +289,65 @@ final class AppleScriptTests: XCTestCase {
       XCTAssertEqual(events.count, 2, "Should have 2 events")
     case .failure(let error):
       XCTFail("String delimiter test failed: \(error.localizedDescription)")
+    }
+  }
+
+  // MARK: - Timeout Behavior Tests
+
+  func testAppleScriptTimeout() throws {
+    // A script that sleeps for 5 seconds should be terminated by a 2-second timeout
+    let script = """
+      delay 5
+      return "should not reach here"
+      """
+
+    let start = Date()
+    let result = runAppleScript(script, timeout: 2)
+    let elapsed = Date().timeIntervalSince(start)
+
+    switch result {
+    case .success:
+      XCTFail("Script should have timed out, not succeeded")
+    case .failure(let error):
+      XCTAssertTrue(
+        error.localizedDescription.contains("timed out"),
+        "Error should indicate a timeout, got: \(error.localizedDescription)")
+    }
+
+    // Should have completed in roughly 2 seconds, not 5
+    XCTAssertLessThan(elapsed, 4.0, "Timeout should have killed the script well before it finished")
+  }
+
+  func testAppleScriptCompletesBeforeTimeout() throws {
+    // A fast script should succeed even with a short timeout
+    let script = """
+      return "fast"
+      """
+
+    let result = runAppleScript(script, timeout: 5)
+
+    switch result {
+    case .success(let output):
+      XCTAssertEqual(output, "fast")
+    case .failure(let error):
+      XCTFail("Fast script should not fail: \(error.localizedDescription)")
+    }
+  }
+
+  func testAppleScriptSyntaxError() throws {
+    // A script with invalid syntax should return an error, not hang
+    let script = """
+      this is not valid applescript at all !!!
+      """
+
+    let result = runAppleScript(script, timeout: 5)
+
+    switch result {
+    case .success:
+      XCTFail("Invalid script should have failed")
+    case .failure:
+      // Expected - syntax error returned as failure
+      break
     }
   }
 }

@@ -1,4 +1,3 @@
-import Cocoa
 import EventKit
 import Foundation
 
@@ -11,6 +10,22 @@ private class CalendarManager {
   private init() {}
 
   func ensureAccess() -> Bool {
+    // If called from the main thread, dispatch to a background queue to avoid
+    // deadlocking when the EventKit permission callback needs the main thread.
+    if Thread.isMainThread {
+      var result = false
+      let semaphore = DispatchSemaphore(value: 0)
+      DispatchQueue.global(qos: .userInitiated).async {
+        result = self._ensureAccess()
+        semaphore.signal()
+      }
+      let waitResult = semaphore.wait(timeout: .now() + 35)
+      return waitResult == .timedOut ? false : result
+    }
+    return _ensureAccess()
+  }
+
+  private func _ensureAccess() -> Bool {
     let status = EKEventStore.authorizationStatus(for: .event)
 
     switch status {
@@ -41,7 +56,10 @@ private class CalendarManager {
       }
     }
 
-    _ = semaphore.wait(timeout: .now() + 60)  // 60s timeout for user interaction
+    let result = semaphore.wait(timeout: .now() + 30)
+    if result == .timedOut {
+      return false
+    }
     return granted
   }
 }
@@ -58,6 +76,44 @@ private struct CalendarEvent: Codable {
   let calendarName: String
   let isAllDay: Bool
   let url: String?
+}
+
+// MARK: - Date Parsing
+
+private let isoDateFormatter: ISO8601DateFormatter = {
+  let formatter = ISO8601DateFormatter()
+  formatter.formatOptions = [
+    .withInternetDateTime, .withDashSeparatorInDate, .withColonSeparatorInTime,
+  ]
+  return formatter
+}()
+
+private let simpleDateFormatter: DateFormatter = {
+  let formatter = DateFormatter()
+  formatter.dateFormat = "yyyy-MM-dd"
+  return formatter
+}()
+
+private func parseDate(_ str: String) -> Date? {
+  if let date = isoDateFormatter.date(from: str) { return date }
+  if let date = simpleDateFormatter.date(from: str) { return date }
+  return nil
+}
+
+// MARK: - Event Mapping
+
+private func mapEvent(_ event: EKEvent) -> CalendarEvent {
+  CalendarEvent(
+    id: event.eventIdentifier,
+    title: event.title,
+    location: event.location,
+    notes: event.notes,
+    startDate: isoDateFormatter.string(from: event.startDate),
+    endDate: isoDateFormatter.string(from: event.endDate),
+    calendarName: event.calendar.title,
+    isAllDay: event.isAllDay,
+    url: event.url?.absoluteString
+  )
 }
 
 // MARK: - Calendar Tools
@@ -82,47 +138,24 @@ private struct GetEventsTool {
       return "{\"error\": \"Calendar access denied\"}"
     }
 
-    let limit = input.limit ?? 10
     let today = Date()
-    let calendar = Calendar.current
-    let defaultEndDate = calendar.date(byAdding: .day, value: 7, to: today)!
-
-    let dateFormatter = ISO8601DateFormatter()
-    dateFormatter.formatOptions = [
-      .withInternetDateTime, .withDashSeparatorInDate, .withColonSeparatorInTime,
-    ]
-
-    let simpleDateFormatter = DateFormatter()
-    simpleDateFormatter.dateFormat = "yyyy-MM-dd"
-
-    func parseDate(_ str: String) -> Date? {
-      if let date = dateFormatter.date(from: str) { return date }
-      if let date = simpleDateFormatter.date(from: str) { return date }
-      return nil
-    }
-
+    let defaultEndDate = Calendar.current.date(byAdding: .day, value: 7, to: today)!
     let startDate = input.fromDate.flatMap(parseDate) ?? today
     let endDate = input.toDate.flatMap(parseDate) ?? defaultEndDate
+    let limit = input.limit ?? 10
 
     let store = CalendarManager.shared.store
     let predicate = store.predicateForEvents(withStart: startDate, end: endDate, calendars: nil)
-    let events = store.events(matching: predicate)
+
+    guard let allEvents = fetchEvents(store: store, predicate: predicate) else {
+      return "{\"error\": \"Calendar query timed out\"}"
+    }
+
+    let eventModels =
+      allEvents
       .sorted { $0.startDate < $1.startDate }
       .prefix(limit)
-
-    let eventModels = events.map { event in
-      CalendarEvent(
-        id: event.eventIdentifier,
-        title: event.title,
-        location: event.location,
-        notes: event.notes,
-        startDate: dateFormatter.string(from: event.startDate),
-        endDate: dateFormatter.string(from: event.endDate),
-        calendarName: event.calendar.title,
-        isAllDay: event.isAllDay,
-        url: event.url?.absoluteString
-      )
-    }
+      .map(mapEvent)
 
     return encodeJSON(eventModels)
   }
@@ -149,49 +182,26 @@ private struct SearchEventsTool {
       return "{\"error\": \"Calendar access denied\"}"
     }
 
-    let limit = input.limit ?? 10
     let today = Date()
-    let calendar = Calendar.current
-    let defaultEndDate = calendar.date(byAdding: .day, value: 30, to: today)!
-
-    let dateFormatter = ISO8601DateFormatter()
-    dateFormatter.formatOptions = [
-      .withInternetDateTime, .withDashSeparatorInDate, .withColonSeparatorInTime,
-    ]
-
-    let simpleDateFormatter = DateFormatter()
-    simpleDateFormatter.dateFormat = "yyyy-MM-dd"
-
-    func parseDate(_ str: String) -> Date? {
-      if let date = dateFormatter.date(from: str) { return date }
-      if let date = simpleDateFormatter.date(from: str) { return date }
-      return nil
-    }
-
+    let defaultEndDate = Calendar.current.date(byAdding: .day, value: 30, to: today)!
     let startDate = input.fromDate.flatMap(parseDate) ?? today
     let endDate = input.toDate.flatMap(parseDate) ?? defaultEndDate
     let searchText = input.searchText.lowercased()
+    let limit = input.limit ?? 10
 
     let store = CalendarManager.shared.store
     let predicate = store.predicateForEvents(withStart: startDate, end: endDate, calendars: nil)
-    let events = store.events(matching: predicate)
+
+    guard let allEvents = fetchEvents(store: store, predicate: predicate) else {
+      return "{\"error\": \"Calendar query timed out\"}"
+    }
+
+    let eventModels =
+      allEvents
       .filter { $0.title.lowercased().contains(searchText) }
       .sorted { $0.startDate < $1.startDate }
       .prefix(limit)
-
-    let eventModels = events.map { event in
-      CalendarEvent(
-        id: event.eventIdentifier,
-        title: event.title,
-        location: event.location,
-        notes: event.notes,
-        startDate: dateFormatter.string(from: event.startDate),
-        endDate: dateFormatter.string(from: event.endDate),
-        calendarName: event.calendar.title,
-        isAllDay: event.isAllDay,
-        url: event.url?.absoluteString
-      )
-    }
+      .map(mapEvent)
 
     return encodeJSON(eventModels)
   }
@@ -225,13 +235,8 @@ private struct CreateEventTool {
       return "{\"success\": false, \"message\": \"Event title cannot be empty\"}"
     }
 
-    let dateFormatter = ISO8601DateFormatter()
-    dateFormatter.formatOptions = [
-      .withInternetDateTime, .withDashSeparatorInDate, .withColonSeparatorInTime,
-    ]
-
-    guard let startDate = dateFormatter.date(from: input.startDate),
-      let endDate = dateFormatter.date(from: input.endDate)
+    guard let startDate = isoDateFormatter.date(from: input.startDate),
+      let endDate = isoDateFormatter.date(from: input.endDate)
     else {
       return
         "{\"success\": false, \"message\": \"Invalid date format. Please use ISO format (YYYY-MM-DDTHH:mm:ssZ)\"}"
@@ -251,15 +256,11 @@ private struct CreateEventTool {
     event.notes = input.notes
     event.isAllDay = input.isAllDay ?? false
 
-    // Find calendar
-    if let calendarName = input.calendarName {
-      if let cal = store.calendars(for: .event).first(where: { $0.title == calendarName }) {
-        event.calendar = cal
-      } else {
-        // Fallback to default if specified not found? Or fail?
-        // Using default is safer for "success"
-        event.calendar = store.defaultCalendarForNewEvents
-      }
+    // Use the specified calendar, falling back to default if not found
+    if let calendarName = input.calendarName,
+      let cal = store.calendars(for: .event).first(where: { $0.title == calendarName })
+    {
+      event.calendar = cal
     } else {
       event.calendar = store.defaultCalendarForNewEvents
     }
@@ -297,10 +298,6 @@ private struct OpenEventTool {
       return "{\"success\": false, \"message\": \"Event not found\"}"
     }
 
-    // Use AppleScript to open the specific event
-    // We can target the event by UID
-
-    // Format date for AppleScript
     let appleScriptDateFormatter = DateFormatter()
     appleScriptDateFormatter.dateStyle = .full
     appleScriptDateFormatter.timeStyle = .medium
@@ -330,19 +327,78 @@ private struct OpenEventTool {
       end tell
       """
 
-    // Simple AppleScript runner
-    var error: NSDictionary?
-    let appleScript = NSAppleScript(source: script)
-    if appleScript?.executeAndReturnError(&error) != nil {
+    // Run AppleScript via osascript process (thread-safe, with timeout)
+    let result = runAppleScript(script)
+    if result.success {
       return "{\"success\": true, \"message\": \"Event opened successfully\"}"
     } else {
-      let msg = error?[NSAppleScript.errorMessage] as? String ?? "Unknown AppleScript error"
-      return "{\"success\": false, \"message\": \"\(escapeJSON(msg))\"}"
+      return "{\"success\": false, \"message\": \"\(escapeJSON(result.error))\"}"
     }
   }
 }
 
 // MARK: - Helper Functions
+
+/// Runs an AppleScript via /usr/bin/osascript in a separate process with a timeout.
+/// Thread-safe (unlike NSAppleScript) and terminates if the script exceeds the timeout.
+private func runAppleScript(_ source: String, timeout: TimeInterval = 15) -> (
+  success: Bool, output: String, error: String
+) {
+  let process = Process()
+  process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+  process.arguments = ["-e", source]
+
+  let outPipe = Pipe()
+  let errPipe = Pipe()
+  process.standardOutput = outPipe
+  process.standardError = errPipe
+
+  do {
+    try process.run()
+  } catch {
+    return (false, "", error.localizedDescription)
+  }
+
+  let timer = DispatchSource.makeTimerSource(queue: .global())
+  timer.schedule(deadline: .now() + timeout)
+  timer.setEventHandler {
+    if process.isRunning { process.terminate() }
+  }
+  timer.resume()
+
+  process.waitUntilExit()
+  timer.cancel()
+
+  let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+  let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+
+  let timedOut = process.terminationReason == .uncaughtSignal
+
+  return (
+    process.terminationStatus == 0 && !timedOut,
+    String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+    timedOut
+      ? "AppleScript timed out after \(Int(timeout)) seconds"
+      : (String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        ?? "")
+  )
+}
+
+/// Fetches events from EventKit with a timeout to prevent blocking indefinitely.
+private func fetchEvents(store: EKEventStore, predicate: NSPredicate, timeout: TimeInterval = 10)
+  -> [EKEvent]?
+{
+  var events: [EKEvent]?
+  let semaphore = DispatchSemaphore(value: 0)
+
+  DispatchQueue.global(qos: .userInitiated).async {
+    events = store.events(matching: predicate)
+    semaphore.signal()
+  }
+
+  let result = semaphore.wait(timeout: .now() + timeout)
+  return result == .timedOut ? nil : events
+}
 
 private func escapeJSON(_ str: String) -> String {
   return
@@ -365,12 +421,10 @@ private func encodeJSON<T: Encodable>(_ value: T) -> String {
   return json
 }
 
-// MARK: - C ABI surface
+// MARK: - C ABI Surface
 
-// Opaque context
 private typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
 
-// Function pointers
 private typealias osr_free_string_t = @convention(c) (UnsafePointer<CChar>?) -> Void
 private typealias osr_init_t = @convention(c) () -> osr_plugin_ctx_t?
 private typealias osr_destroy_t = @convention(c) (osr_plugin_ctx_t?) -> Void
@@ -391,7 +445,6 @@ private struct osr_plugin_api {
   var invoke: osr_invoke_t?
 }
 
-// Context state (simple wrapper class to hold state)
 private class PluginContext {
   let getEventsTool = GetEventsTool()
   let searchEventsTool = SearchEventsTool()
@@ -399,13 +452,11 @@ private class PluginContext {
   let openEventTool = OpenEventTool()
 }
 
-// Helper to return C strings
 private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
   guard let ptr = strdup(s) else { return nil }
   return UnsafePointer(ptr)
 }
 
-// API Implementation
 private var api: osr_plugin_api = {
   var api = osr_plugin_api()
 
@@ -424,7 +475,6 @@ private var api: osr_plugin_api = {
   }
 
   api.get_manifest = { ctxPtr in
-    // Manifest JSON matching new spec
     let manifest = """
       {
         "plugin_id": "osaurus.calendar",
