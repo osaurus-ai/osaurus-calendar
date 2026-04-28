@@ -14,7 +14,7 @@ let package = Package(
         ),
         .testTarget(
             name: "osaurus_calendarTests",
-            dependencies: [],
+            dependencies: ["osaurus_calendar"],
             path: "Tests/osaurus_calendarTests"
         )
     ]
