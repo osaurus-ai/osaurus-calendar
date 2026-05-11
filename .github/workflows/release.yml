@@ -11,5 +11,5 @@ permissions:
 
 jobs:
   release:
-    uses: dinoki-ai/osaurus-tools/.github/workflows/build-plugin.yml@master
+    uses: osaurus-ai/osaurus-tools/.github/workflows/build-plugin.yml@master
     secrets: inherit
