@@ -489,6 +489,7 @@ private var api: osr_plugin_api = {
           "tools": [
             {
               "id": "get_events",
+              "widget": true,
               "description": "Get calendar events in a specified date range",
               "parameters": {
                 "type": "object",
