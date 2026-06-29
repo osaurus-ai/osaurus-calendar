@@ -131,24 +131,43 @@ private struct GetEventsTool {
     guard let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
     else {
-      return "{\"error\": \"Invalid arguments\"}"
+      return Envelope.failure(.invalidArgs, "Invalid arguments: expected a JSON object")
     }
 
     guard CalendarManager.shared.ensureAccess() else {
-      return "{\"error\": \"Calendar access denied\"}"
+      return Envelope.failure(.unavailable, "Calendar access denied", retryable: false)
     }
 
     let today = Date()
     let defaultEndDate = Calendar.current.date(byAdding: .day, value: 7, to: today)!
-    let startDate = input.fromDate.flatMap(parseDate) ?? today
-    let endDate = input.toDate.flatMap(parseDate) ?? defaultEndDate
+
+    var startDate = today
+    if let fromDate = input.fromDate {
+      guard let parsed = parseDate(fromDate) else {
+        return Envelope.failure(.invalidArgs, "Invalid date for field 'fromDate': \(fromDate)")
+      }
+      startDate = parsed
+    }
+
+    var endDate = defaultEndDate
+    if let toDate = input.toDate {
+      guard let parsed = parseDate(toDate) else {
+        return Envelope.failure(.invalidArgs, "Invalid date for field 'toDate': \(toDate)")
+      }
+      endDate = parsed
+    }
+
+    guard endDate >= startDate else {
+      return Envelope.failure(.invalidArgs, "toDate must be on or after fromDate")
+    }
+
     let limit = input.limit ?? 10
 
     let store = CalendarManager.shared.store
     let predicate = store.predicateForEvents(withStart: startDate, end: endDate, calendars: nil)
 
     guard let allEvents = fetchEvents(store: store, predicate: predicate) else {
-      return "{\"error\": \"Calendar query timed out\"}"
+      return Envelope.failure(.executionError, "Calendar query timed out")
     }
 
     let eventModels =
@@ -175,17 +194,40 @@ private struct SearchEventsTool {
     guard let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
     else {
-      return "{\"error\": \"Invalid arguments\"}"
+      return Envelope.failure(.invalidArgs, "Invalid arguments: expected a JSON object")
+    }
+
+    guard !input.searchText.trimmingCharacters(in: .whitespaces).isEmpty else {
+      return Envelope.failure(.invalidArgs, "Missing required field 'searchText'")
     }
 
     guard CalendarManager.shared.ensureAccess() else {
-      return "{\"error\": \"Calendar access denied\"}"
+      return Envelope.failure(.unavailable, "Calendar access denied", retryable: false)
     }
 
     let today = Date()
     let defaultEndDate = Calendar.current.date(byAdding: .day, value: 30, to: today)!
-    let startDate = input.fromDate.flatMap(parseDate) ?? today
-    let endDate = input.toDate.flatMap(parseDate) ?? defaultEndDate
+
+    var startDate = today
+    if let fromDate = input.fromDate {
+      guard let parsed = parseDate(fromDate) else {
+        return Envelope.failure(.invalidArgs, "Invalid date for field 'fromDate': \(fromDate)")
+      }
+      startDate = parsed
+    }
+
+    var endDate = defaultEndDate
+    if let toDate = input.toDate {
+      guard let parsed = parseDate(toDate) else {
+        return Envelope.failure(.invalidArgs, "Invalid date for field 'toDate': \(toDate)")
+      }
+      endDate = parsed
+    }
+
+    guard endDate >= startDate else {
+      return Envelope.failure(.invalidArgs, "toDate must be on or after fromDate")
+    }
+
     let searchText = input.searchText.lowercased()
     let limit = input.limit ?? 10
 
@@ -193,7 +235,7 @@ private struct SearchEventsTool {
     let predicate = store.predicateForEvents(withStart: startDate, end: endDate, calendars: nil)
 
     guard let allEvents = fetchEvents(store: store, predicate: predicate) else {
-      return "{\"error\": \"Calendar query timed out\"}"
+      return Envelope.failure(.executionError, "Calendar query timed out")
     }
 
     let eventModels =
@@ -224,26 +266,31 @@ private struct CreateEventTool {
     guard let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
     else {
-      return "{\"error\": \"Invalid arguments\"}"
+      return Envelope.failure(.invalidArgs, "Invalid arguments: expected a JSON object")
     }
 
     guard CalendarManager.shared.ensureAccess() else {
-      return "{\"success\": false, \"message\": \"Calendar access denied\"}"
+      return Envelope.failure(.unavailable, "Calendar access denied", retryable: false)
     }
 
     guard !input.title.trimmingCharacters(in: .whitespaces).isEmpty else {
-      return "{\"success\": false, \"message\": \"Event title cannot be empty\"}"
+      return Envelope.failure(.invalidArgs, "Missing required field 'title'")
     }
 
-    guard let startDate = isoDateFormatter.date(from: input.startDate),
-      let endDate = isoDateFormatter.date(from: input.endDate)
-    else {
-      return
-        "{\"success\": false, \"message\": \"Invalid date format. Please use ISO format (YYYY-MM-DDTHH:mm:ssZ)\"}"
+    guard let startDate = isoDateFormatter.date(from: input.startDate) else {
+      return Envelope.failure(
+        .invalidArgs,
+        "Invalid date for field 'startDate': \(input.startDate). Use ISO format (YYYY-MM-DDTHH:mm:ssZ)")
+    }
+
+    guard let endDate = isoDateFormatter.date(from: input.endDate) else {
+      return Envelope.failure(
+        .invalidArgs,
+        "Invalid date for field 'endDate': \(input.endDate). Use ISO format (YYYY-MM-DDTHH:mm:ssZ)")
     }
 
     guard endDate > startDate else {
-      return "{\"success\": false, \"message\": \"End date must be after start date\"}"
+      return Envelope.failure(.invalidArgs, "endDate must be after startDate")
     }
 
     let store = CalendarManager.shared.store
@@ -270,7 +317,7 @@ private struct CreateEventTool {
       return
         "{\"success\": true, \"message\": \"Event \\\"\(escapeJSON(input.title))\\\" created successfully.\", \"eventId\": \"\(escapeJSON(event.eventIdentifier))\"}"
     } catch {
-      return "{\"success\": false, \"message\": \"\(escapeJSON(error.localizedDescription))\"}"
+      return Envelope.failure(.executionError, error.localizedDescription)
     }
   }
 }
@@ -286,16 +333,20 @@ private struct OpenEventTool {
     guard let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
     else {
-      return "{\"error\": \"Invalid arguments\"}"
+      return Envelope.failure(.invalidArgs, "Invalid arguments: expected a JSON object")
+    }
+
+    guard !input.eventId.trimmingCharacters(in: .whitespaces).isEmpty else {
+      return Envelope.failure(.invalidArgs, "Missing required field 'eventId'")
     }
 
     guard CalendarManager.shared.ensureAccess() else {
-      return "{\"success\": false, \"message\": \"Calendar access denied\"}"
+      return Envelope.failure(.unavailable, "Calendar access denied", retryable: false)
     }
 
     let store = CalendarManager.shared.store
     guard let event = store.event(withIdentifier: input.eventId) else {
-      return "{\"success\": false, \"message\": \"Event not found\"}"
+      return Envelope.failure(.notFound, "Event not found: \(input.eventId)")
     }
 
     let appleScriptDateFormatter = DateFormatter()
@@ -304,15 +355,18 @@ private struct OpenEventTool {
     let dateString = appleScriptDateFormatter.string(from: event.startDate)
 
     let eventId = event.eventIdentifier ?? input.eventId
+    let calendarTitle = escapeAppleScript(event.calendar.title)
+    let safeEventId = escapeAppleScript(eventId)
+    let safeDateString = escapeAppleScript(dateString)
 
     let script = """
       tell application "Calendar"
           activate
           set found to false
           repeat with cal in calendars
-              if name of cal is "\(event.calendar.title)" then
+              if name of cal is "\(calendarTitle)" then
                   try
-                      set evt to (first event of cal whose uid is "\(eventId)")
+                      set evt to (first event of cal whose uid is "\(safeEventId)")
                       show evt
                       set found to true
                       exit repeat
@@ -322,7 +376,7 @@ private struct OpenEventTool {
           if not found then
               -- Fallback: switch to date
               switch view to day view
-              view calendar date (date "\(dateString)")
+              view calendar date (date "\(safeDateString)")
           end if
       end tell
       """
@@ -332,7 +386,7 @@ private struct OpenEventTool {
     if result.success {
       return "{\"success\": true, \"message\": \"Event opened successfully\"}"
     } else {
-      return "{\"success\": false, \"message\": \"\(escapeJSON(result.error))\"}"
+      return Envelope.failure(.executionError, result.error)
     }
   }
 }
@@ -398,6 +452,15 @@ private func fetchEvents(store: EKEventStore, predicate: NSPredicate, timeout: T
 
   let result = semaphore.wait(timeout: .now() + timeout)
   return result == .timedOut ? nil : events
+}
+
+/// Escapes a string so it can be safely embedded inside an AppleScript string
+/// literal (double-quoted), preventing injection via backslashes or quotes.
+private func escapeAppleScript(_ str: String) -> String {
+  return
+    str
+    .replacingOccurrences(of: "\\", with: "\\\\")
+    .replacingOccurrences(of: "\"", with: "\\\"")
 }
 
 private func escapeJSON(_ str: String) -> String {
@@ -475,7 +538,44 @@ private var api: osr_plugin_api = {
   }
 
   api.get_manifest = { ctxPtr in
-    let manifest = """
+    return makeCString(calendarManifestJSON)
+  }
+
+  api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
+    guard let ctxPtr = ctxPtr,
+      let typePtr = typePtr,
+      let idPtr = idPtr,
+      let payloadPtr = payloadPtr
+    else { return nil }
+
+    let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
+    let type = String(cString: typePtr)
+    let id = String(cString: idPtr)
+    let payload = String(cString: payloadPtr)
+
+    guard type == "tool" else {
+      return makeCString(Envelope.failure(.invalidArgs, "Unknown capability type: \(type)"))
+    }
+
+    switch id {
+    case ctx.getEventsTool.name:
+      return makeCString(ctx.getEventsTool.run(args: payload))
+    case ctx.searchEventsTool.name:
+      return makeCString(ctx.searchEventsTool.run(args: payload))
+    case ctx.createEventTool.name:
+      return makeCString(ctx.createEventTool.run(args: payload))
+    case ctx.openEventTool.name:
+      return makeCString(ctx.openEventTool.run(args: payload))
+    default:
+      return makeCString(Envelope.failure(.notFound, "Unknown tool: \(id)"))
+    }
+  }
+
+  return api
+}()
+
+/// File-scope manifest JSON embedded by the plugin. Referenced from `get_manifest`.
+let calendarManifestJSON = """
       {
         "plugin_id": "osaurus.calendar",
         "name": "Calendar",
@@ -600,41 +700,6 @@ private var api: osr_plugin_api = {
         }
       }
       """
-    return makeCString(manifest)
-  }
-
-  api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
-    guard let ctxPtr = ctxPtr,
-      let typePtr = typePtr,
-      let idPtr = idPtr,
-      let payloadPtr = payloadPtr
-    else { return nil }
-
-    let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
-    let type = String(cString: typePtr)
-    let id = String(cString: idPtr)
-    let payload = String(cString: payloadPtr)
-
-    guard type == "tool" else {
-      return makeCString("{\"error\": \"Unknown capability type\"}")
-    }
-
-    switch id {
-    case ctx.getEventsTool.name:
-      return makeCString(ctx.getEventsTool.run(args: payload))
-    case ctx.searchEventsTool.name:
-      return makeCString(ctx.searchEventsTool.run(args: payload))
-    case ctx.createEventTool.name:
-      return makeCString(ctx.createEventTool.run(args: payload))
-    case ctx.openEventTool.name:
-      return makeCString(ctx.openEventTool.run(args: payload))
-    default:
-      return makeCString("{\"error\": \"Unknown tool: \(id)\"}")
-    }
-  }
-
-  return api
-}()
 
 @_cdecl("osaurus_plugin_entry")
 public func osaurus_plugin_entry() -> UnsafeRawPointer? {
