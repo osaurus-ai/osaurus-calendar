@@ -14,7 +14,8 @@ let package = Package(
         .target(
             name: "osaurus_calendar",
             dependencies: [
-                .product(name: "OsaurusPluginKit", package: "osaurus-plugin-sdk")
+                .product(name: "OsaurusPluginABI", package: "osaurus-plugin-sdk"),
+                .product(name: "OsaurusPluginKit", package: "osaurus-plugin-sdk"),
             ],
             path: "Sources/osaurus_calendar"
         ),

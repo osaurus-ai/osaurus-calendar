@@ -1,5 +1,6 @@
 import EventKit
 import Foundation
+import OsaurusPluginABI
 import OsaurusPluginKit
 
 // MARK: - EventKit Helper
@@ -518,28 +519,6 @@ private func encodeJSON<T: Encodable>(_ value: T) -> String {
 
 // MARK: - C ABI Surface
 
-private typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
-
-private typealias osr_free_string_t = @convention(c) (UnsafePointer<CChar>?) -> Void
-private typealias osr_init_t = @convention(c) () -> osr_plugin_ctx_t?
-private typealias osr_destroy_t = @convention(c) (osr_plugin_ctx_t?) -> Void
-private typealias osr_get_manifest_t = @convention(c) (osr_plugin_ctx_t?) -> UnsafePointer<CChar>?
-private typealias osr_invoke_t =
-  @convention(c) (
-    osr_plugin_ctx_t?,
-    UnsafePointer<CChar>?,  // type
-    UnsafePointer<CChar>?,  // id
-    UnsafePointer<CChar>?  // payload
-  ) -> UnsafePointer<CChar>?
-
-private struct osr_plugin_api {
-  var free_string: osr_free_string_t?
-  var `init`: osr_init_t?
-  var destroy: osr_destroy_t?
-  var get_manifest: osr_get_manifest_t?
-  var invoke: osr_invoke_t?
-}
-
 private class PluginContext {
   let getEventsTool = GetEventsTool()
   let searchEventsTool = SearchEventsTool()
@@ -547,33 +526,19 @@ private class PluginContext {
   let openEventTool = OpenEventTool()
 }
 
-private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
-  guard let ptr = strdup(s) else { return nil }
-  return UnsafePointer(ptr)
-}
-
-private var api: osr_plugin_api = {
-  var api = osr_plugin_api()
-
-  api.free_string = { ptr in
-    if let p = ptr { free(UnsafeMutableRawPointer(mutating: p)) }
-  }
-
-  api.`init` = {
-    let ctx = PluginContext()
-    return Unmanaged.passRetained(ctx).toOpaque()
-  }
-
-  api.destroy = { ctxPtr in
+private var pluginAPI = PluginEntry.makeAPI(
+  version: OsrABIVersion.v2,
+  init: {
+    Unmanaged.passRetained(PluginContext()).toOpaque()
+  },
+  destroy: { ctxPtr in
     guard let ctxPtr = ctxPtr else { return }
     Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
-  }
-
-  api.get_manifest = { ctxPtr in
-    return makeCString(calendarManifestJSON)
-  }
-
-  api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
+  },
+  getManifest: { _ in
+    osrMakeCString(calendarManifestJSON)
+  },
+  invoke: { ctxPtr, typePtr, idPtr, payloadPtr in
     guard let ctxPtr = ctxPtr,
       let typePtr = typePtr,
       let idPtr = idPtr,
@@ -586,25 +551,23 @@ private var api: osr_plugin_api = {
     let payload = String(cString: payloadPtr)
 
     guard type == "tool" else {
-      return makeCString(Envelope.failure(.invalidArgs, "Unknown capability type: \(type)"))
+      return osrMakeCString(Envelope.failure(.invalidArgs, "Unknown capability type: \(type)"))
     }
 
     switch id {
     case ctx.getEventsTool.name:
-      return makeCString(ctx.getEventsTool.run(args: payload))
+      return osrMakeCString(ctx.getEventsTool.run(args: payload))
     case ctx.searchEventsTool.name:
-      return makeCString(ctx.searchEventsTool.run(args: payload))
+      return osrMakeCString(ctx.searchEventsTool.run(args: payload))
     case ctx.createEventTool.name:
-      return makeCString(ctx.createEventTool.run(args: payload))
+      return osrMakeCString(ctx.createEventTool.run(args: payload))
     case ctx.openEventTool.name:
-      return makeCString(ctx.openEventTool.run(args: payload))
+      return osrMakeCString(ctx.openEventTool.run(args: payload))
     default:
-      return makeCString(Envelope.failure(.notFound, "Unknown tool: \(id)"))
+      return osrMakeCString(Envelope.failure(.notFound, "Unknown tool: \(id)"))
     }
   }
-
-  return api
-}()
+)
 
 /// File-scope manifest JSON embedded by the plugin. Referenced from `get_manifest`.
 let calendarManifestJSON = """
@@ -733,7 +696,12 @@ let calendarManifestJSON = """
       }
       """
 
+@_cdecl("osaurus_plugin_entry_v2")
+public func osaurus_plugin_entry_v2(_ host: UnsafeRawPointer?) -> UnsafeRawPointer? {
+  PluginEntry.enterV2(host, api: &pluginAPI)
+}
+
 @_cdecl("osaurus_plugin_entry")
 public func osaurus_plugin_entry() -> UnsafeRawPointer? {
-  return UnsafeRawPointer(&api)
+  PluginEntry.enterV1(api: &pluginAPI)
 }
