@@ -668,7 +668,7 @@ let calendarManifestJSON = """
       {
         "plugin_id": "osaurus.calendar",
         "name": "Calendar",
-        "version": "1.0.5",
+        "version": "1.0.10",
         "description": "A calendar plugin for macOS Calendar.app integration",
         "license": "MIT",
         "authors": ["Osaurus"],

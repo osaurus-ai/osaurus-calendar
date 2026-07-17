@@ -19,6 +19,11 @@ final class CalendarManifestTests: XCTestCase {
     XCTAssertEqual(manifest["plugin_id"] as? String, "osaurus.calendar")
   }
 
+  func testManifestVersionMatchesRelease() throws {
+    let manifest = try decodeManifest()
+    XCTAssertEqual(manifest["version"] as? String, "1.0.10")
+  }
+
   func testManifestToolsHaveIdAndDescription() throws {
     let manifest = try decodeManifest()
     let capabilities = try XCTUnwrap(
