@@ -1,4 +1,5 @@
 import Foundation
+import OsaurusPluginKit
 import XCTest
 
 @testable import osaurus_calendar

@@ -1,5 +1,6 @@
 import EventKit
 import Foundation
+import OsaurusPluginKit
 
 // MARK: - EventKit Helper
 
@@ -423,87 +424,29 @@ private struct OpenEventTool {
 
 // MARK: - Helper Functions
 
-private let maxCapturedOutputBytes = 5 * 1024 * 1024
-
-/// Runs an AppleScript via /usr/bin/osascript in a separate process with a timeout.
-/// Thread-safe (unlike NSAppleScript). Streams are drained concurrently so large
-/// output cannot deadlock the pipe; on timeout the process is terminated and then
-/// killed after a grace period.
+/// Runs an AppleScript via /usr/bin/osascript through the SDK's ProcessRunner
+/// (thread-safe, concurrent stream draining, SIGTERM→SIGKILL on timeout).
 private func runAppleScript(_ source: String, timeout: TimeInterval = 15) -> (
   success: Bool, timedOut: Bool, output: String, error: String
 ) {
-  let process = Process()
-  process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-  process.arguments = ["-e", source]
-
-  let outPipe = Pipe()
-  let errPipe = Pipe()
-  process.standardOutput = outPipe
-  process.standardError = errPipe
-
-  let lock = NSLock()
-  var outData = Data()
-  var errData = Data()
-
-  outPipe.fileHandleForReading.readabilityHandler = { handle in
-    let chunk = handle.availableData
-    lock.lock()
-    if outData.count < maxCapturedOutputBytes { outData.append(chunk) }
-    lock.unlock()
-  }
-  errPipe.fileHandleForReading.readabilityHandler = { handle in
-    let chunk = handle.availableData
-    lock.lock()
-    if errData.count < maxCapturedOutputBytes { errData.append(chunk) }
-    lock.unlock()
-  }
-
+  let result: ProcessRunner.Output
   do {
-    try process.run()
+    result = try ProcessRunner.run(
+      executable: "/usr/bin/osascript", arguments: ["-e", source], timeout: timeout)
+  } catch ProcessRunnerError.launchFailed(let reason) {
+    return (false, false, "", reason)
   } catch {
-    outPipe.fileHandleForReading.readabilityHandler = nil
-    errPipe.fileHandleForReading.readabilityHandler = nil
     return (false, false, "", error.localizedDescription)
   }
 
-  let timedOutFlag = NSLock()
-  var timedOut = false
-
-  let timer = DispatchSource.makeTimerSource(queue: .global())
-  timer.schedule(deadline: .now() + timeout)
-  timer.setEventHandler {
-    timedOutFlag.lock()
-    timedOut = true
-    timedOutFlag.unlock()
-    if process.isRunning { process.terminate() }
-    DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-      if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-    }
-  }
-  timer.resume()
-
-  process.waitUntilExit()
-  timer.cancel()
-
-  outPipe.fileHandleForReading.readabilityHandler = nil
-  errPipe.fileHandleForReading.readabilityHandler = nil
-
-  timedOutFlag.lock()
-  let didTimeOut = timedOut
-  timedOutFlag.unlock()
-
-  lock.lock()
-  let output =
-    String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-  let errOutput =
-    String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-  lock.unlock()
+  let output = result.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+  let errOutput = result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
 
   return (
-    process.terminationStatus == 0 && !didTimeOut,
-    didTimeOut,
+    result.exitStatus == 0 && !result.timedOut,
+    result.timedOut,
     output,
-    didTimeOut ? "AppleScript timed out after \(Int(timeout)) seconds" : errOutput
+    result.timedOut ? "AppleScript timed out after \(Int(timeout)) seconds" : errOutput
   )
 }
 
