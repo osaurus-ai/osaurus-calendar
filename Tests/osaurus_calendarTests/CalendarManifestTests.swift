@@ -55,7 +55,7 @@ final class CalendarManifestTests: XCTestCase {
     XCTAssertEqual(object["ok"] as? Bool, false)
     XCTAssertEqual(object["kind"] as? String, "invalid_args")
     XCTAssertEqual(object["message"] as? String, "bad input")
-    XCTAssertEqual(object["retryable"] as? Bool, true)
+    XCTAssertEqual(object["retryable"] as? Bool, false)
   }
 
   func testEnvelopeDefaultRetryablePerKind() throws {
@@ -65,17 +65,18 @@ final class CalendarManifestTests: XCTestCase {
       return try XCTUnwrap(object["retryable"] as? Bool)
     }
 
-    XCTAssertEqual(try retryable(Envelope.failure(.invalidArgs, "x")), true)
+    XCTAssertEqual(try retryable(Envelope.failure(.invalidArgs, "x")), false)
     XCTAssertEqual(try retryable(Envelope.failure(.executionError, "x")), true)
-    XCTAssertEqual(try retryable(Envelope.failure(.unavailable, "x")), true)
+    XCTAssertEqual(try retryable(Envelope.failure(.timeout, "x")), true)
+    XCTAssertEqual(try retryable(Envelope.failure(.permissionDenied, "x")), false)
     XCTAssertEqual(try retryable(Envelope.failure(.notFound, "x")), false)
   }
 
   func testEnvelopeFailureRespectsExplicitRetryable() throws {
-    let json = Envelope.failure(.unavailable, "denied", retryable: false)
+    let json = Envelope.failure(.executionError, "flaky", retryable: false)
     let data = try XCTUnwrap(json.data(using: .utf8))
     let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-    XCTAssertEqual(object["kind"] as? String, "unavailable")
+    XCTAssertEqual(object["kind"] as? String, "execution_error")
     XCTAssertEqual(object["retryable"] as? Bool, false)
   }
 
