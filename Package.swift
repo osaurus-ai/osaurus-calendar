@@ -23,7 +23,9 @@ let package = Package(
             name: "osaurus_calendarTests",
             dependencies: [
                 "osaurus_calendar",
+                .product(name: "OsaurusPluginABI", package: "osaurus-plugin-sdk"),
                 .product(name: "OsaurusPluginKit", package: "osaurus-plugin-sdk"),
+                .product(name: "OsaurusPluginTestSupport", package: "osaurus-plugin-sdk"),
             ],
             path: "Tests/osaurus_calendarTests"
         )

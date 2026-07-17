@@ -25,29 +25,8 @@ final class CalendarManifestTests: XCTestCase {
     XCTAssertEqual(manifest["version"] as? String, "1.0.10")
   }
 
-  func testManifestToolsHaveIdAndDescription() throws {
-    let manifest = try decodeManifest()
-    let capabilities = try XCTUnwrap(
-      manifest["capabilities"] as? [String: Any], "Manifest should have capabilities")
-    let tools = try XCTUnwrap(
-      capabilities["tools"] as? [[String: Any]], "Capabilities should have a tools array")
-
-    XCTAssertFalse(tools.isEmpty, "Manifest should declare at least one tool")
-
-    for (index, tool) in tools.enumerated() {
-      let id = tool["id"] as? String
-      XCTAssertNotNil(id, "Tool at index \(index) must have an 'id'")
-      XCTAssertFalse(
-        (id ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-        "Tool at index \(index) must have a non-empty 'id'")
-
-      let description = tool["description"] as? String
-      XCTAssertNotNil(description, "Tool '\(id ?? "?")' must have a 'description'")
-      XCTAssertFalse(
-        (description ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-        "Tool '\(id ?? "?")' must have a non-empty 'description'")
-    }
-  }
+  // Per-tool id/description/parameters checks are now covered by
+  // ManifestConformance in SDKConformanceTests.
 
   // MARK: - Envelope Tests
 
