@@ -1,7 +1,15 @@
 import EventKit
 import Foundation
+import OsaurusPluginABI
+import OsaurusPluginKit
 
 // MARK: - EventKit Helper
+
+enum CalendarAccess {
+  case granted
+  case denied
+  case timedOut
+}
 
 private class CalendarManager {
   static let shared = CalendarManager()
@@ -9,38 +17,38 @@ private class CalendarManager {
 
   private init() {}
 
-  func ensureAccess() -> Bool {
+  func ensureAccess() -> CalendarAccess {
     // If called from the main thread, dispatch to a background queue to avoid
     // deadlocking when the EventKit permission callback needs the main thread.
     if Thread.isMainThread {
-      var result = false
+      var result: CalendarAccess = .timedOut
       let semaphore = DispatchSemaphore(value: 0)
       DispatchQueue.global(qos: .userInitiated).async {
         result = self._ensureAccess()
         semaphore.signal()
       }
       let waitResult = semaphore.wait(timeout: .now() + 35)
-      return waitResult == .timedOut ? false : result
+      return waitResult == .timedOut ? .timedOut : result
     }
     return _ensureAccess()
   }
 
-  private func _ensureAccess() -> Bool {
+  private func _ensureAccess() -> CalendarAccess {
     let status = EKEventStore.authorizationStatus(for: .event)
 
     switch status {
     case .authorized, .fullAccess:
-      return true
+      return .granted
     case .notDetermined:
       return requestAccess()
     case .denied, .restricted, .writeOnly:
-      return false
+      return .denied
     @unknown default:
-      return false
+      return .denied
     }
   }
 
-  private func requestAccess() -> Bool {
+  private func requestAccess() -> CalendarAccess {
     let semaphore = DispatchSemaphore(value: 0)
     var granted = false
 
@@ -58,9 +66,23 @@ private class CalendarManager {
 
     let result = semaphore.wait(timeout: .now() + 30)
     if result == .timedOut {
-      return false
+      return .timedOut
     }
-    return granted
+    return granted ? .granted : .denied
+  }
+}
+
+/// Returns a failure envelope for non-granted access, or nil when granted.
+private func calendarAccessFailure(_ access: CalendarAccess) -> String? {
+  switch access {
+  case .granted:
+    return nil
+  case .denied:
+    return Envelope.failure(
+      .permissionDenied,
+      "Calendar access denied. Enable it in System Settings > Privacy & Security > Calendars.")
+  case .timedOut:
+    return Envelope.failure(.timeout, "Timed out waiting for Calendar permission")
   }
 }
 
@@ -134,8 +156,8 @@ private struct GetEventsTool {
       return Envelope.failure(.invalidArgs, "Invalid arguments: expected a JSON object")
     }
 
-    guard CalendarManager.shared.ensureAccess() else {
-      return Envelope.failure(.unavailable, "Calendar access denied", retryable: false)
+    if let failure = calendarAccessFailure(CalendarManager.shared.ensureAccess()) {
+      return failure
     }
 
     let today = Date()
@@ -161,13 +183,17 @@ private struct GetEventsTool {
       return Envelope.failure(.invalidArgs, "toDate must be on or after fromDate")
     }
 
-    let limit = input.limit ?? 10
+    let limit: Int
+    switch Validation.resolveLimit(input.limit, default: 10) {
+    case .ok(let value): limit = value
+    case .invalid(let message): return Envelope.failure(.invalidArgs, message)
+    }
 
     let store = CalendarManager.shared.store
     let predicate = store.predicateForEvents(withStart: startDate, end: endDate, calendars: nil)
 
     guard let allEvents = fetchEvents(store: store, predicate: predicate) else {
-      return Envelope.failure(.executionError, "Calendar query timed out")
+      return Envelope.failure(.timeout, "Calendar query timed out")
     }
 
     let eventModels =
@@ -201,8 +227,8 @@ private struct SearchEventsTool {
       return Envelope.failure(.invalidArgs, "Missing required field 'searchText'")
     }
 
-    guard CalendarManager.shared.ensureAccess() else {
-      return Envelope.failure(.unavailable, "Calendar access denied", retryable: false)
+    if let failure = calendarAccessFailure(CalendarManager.shared.ensureAccess()) {
+      return failure
     }
 
     let today = Date()
@@ -229,13 +255,17 @@ private struct SearchEventsTool {
     }
 
     let searchText = input.searchText.lowercased()
-    let limit = input.limit ?? 10
+    let limit: Int
+    switch Validation.resolveLimit(input.limit, default: 10) {
+    case .ok(let value): limit = value
+    case .invalid(let message): return Envelope.failure(.invalidArgs, message)
+    }
 
     let store = CalendarManager.shared.store
     let predicate = store.predicateForEvents(withStart: startDate, end: endDate, calendars: nil)
 
     guard let allEvents = fetchEvents(store: store, predicate: predicate) else {
-      return Envelope.failure(.executionError, "Calendar query timed out")
+      return Envelope.failure(.timeout, "Calendar query timed out")
     }
 
     let eventModels =
@@ -269,8 +299,8 @@ private struct CreateEventTool {
       return Envelope.failure(.invalidArgs, "Invalid arguments: expected a JSON object")
     }
 
-    guard CalendarManager.shared.ensureAccess() else {
-      return Envelope.failure(.unavailable, "Calendar access denied", retryable: false)
+    if let failure = calendarAccessFailure(CalendarManager.shared.ensureAccess()) {
+      return failure
     }
 
     guard !input.title.trimmingCharacters(in: .whitespaces).isEmpty else {
@@ -340,8 +370,8 @@ private struct OpenEventTool {
       return Envelope.failure(.invalidArgs, "Missing required field 'eventId'")
     }
 
-    guard CalendarManager.shared.ensureAccess() else {
-      return Envelope.failure(.unavailable, "Calendar access denied", retryable: false)
+    if let failure = calendarAccessFailure(CalendarManager.shared.ensureAccess()) {
+      return failure
     }
 
     let store = CalendarManager.shared.store
@@ -385,6 +415,8 @@ private struct OpenEventTool {
     let result = runAppleScript(script)
     if result.success {
       return "{\"success\": true, \"message\": \"Event opened successfully\"}"
+    } else if result.timedOut {
+      return Envelope.failure(.timeout, result.error)
     } else {
       return Envelope.failure(.executionError, result.error)
     }
@@ -393,65 +425,66 @@ private struct OpenEventTool {
 
 // MARK: - Helper Functions
 
-/// Runs an AppleScript via /usr/bin/osascript in a separate process with a timeout.
-/// Thread-safe (unlike NSAppleScript) and terminates if the script exceeds the timeout.
+/// Runs an AppleScript via /usr/bin/osascript through the SDK's ProcessRunner
+/// (thread-safe, concurrent stream draining, SIGTERM→SIGKILL on timeout).
 private func runAppleScript(_ source: String, timeout: TimeInterval = 15) -> (
-  success: Bool, output: String, error: String
+  success: Bool, timedOut: Bool, output: String, error: String
 ) {
-  let process = Process()
-  process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-  process.arguments = ["-e", source]
-
-  let outPipe = Pipe()
-  let errPipe = Pipe()
-  process.standardOutput = outPipe
-  process.standardError = errPipe
-
+  let result: ProcessRunner.Output
   do {
-    try process.run()
+    result = try ProcessRunner.run(
+      executable: "/usr/bin/osascript", arguments: ["-e", source], timeout: timeout)
+  } catch ProcessRunnerError.launchFailed(let reason) {
+    return (false, false, "", reason)
   } catch {
-    return (false, "", error.localizedDescription)
+    return (false, false, "", error.localizedDescription)
   }
 
-  let timer = DispatchSource.makeTimerSource(queue: .global())
-  timer.schedule(deadline: .now() + timeout)
-  timer.setEventHandler {
-    if process.isRunning { process.terminate() }
-  }
-  timer.resume()
-
-  process.waitUntilExit()
-  timer.cancel()
-
-  let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-  let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-
-  let timedOut = process.terminationReason == .uncaughtSignal
+  let output = result.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+  let errOutput = result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
 
   return (
-    process.terminationStatus == 0 && !timedOut,
-    String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
-    timedOut
-      ? "AppleScript timed out after \(Int(timeout)) seconds"
-      : (String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        ?? "")
+    result.exitStatus == 0 && !result.timedOut,
+    result.timedOut,
+    output,
+    result.timedOut ? "AppleScript timed out after \(Int(timeout)) seconds" : errOutput
   )
 }
 
 /// Fetches events from EventKit with a timeout to prevent blocking indefinitely.
+/// Returns nil on timeout; the result is handed over under a lock so a late
+/// completion cannot race with the timed-out reader.
 private func fetchEvents(store: EKEventStore, predicate: NSPredicate, timeout: TimeInterval = 10)
   -> [EKEvent]?
 {
-  var events: [EKEvent]?
+  let box = ResultBox<[EKEvent]>()
   let semaphore = DispatchSemaphore(value: 0)
 
   DispatchQueue.global(qos: .userInitiated).async {
-    events = store.events(matching: predicate)
+    box.set(store.events(matching: predicate))
     semaphore.signal()
   }
 
   let result = semaphore.wait(timeout: .now() + timeout)
-  return result == .timedOut ? nil : events
+  return result == .timedOut ? nil : box.get()
+}
+
+/// Thread-safe container for handing a result across the semaphore boundary.
+private final class ResultBox<T> {
+  private let lock = NSLock()
+  private var value: T?
+
+  func set(_ newValue: T) {
+    lock.lock()
+    value = newValue
+    lock.unlock()
+  }
+
+  func get() -> T? {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
+  }
 }
 
 /// Escapes a string so it can be safely embedded inside an AppleScript string
@@ -486,28 +519,6 @@ private func encodeJSON<T: Encodable>(_ value: T) -> String {
 
 // MARK: - C ABI Surface
 
-private typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
-
-private typealias osr_free_string_t = @convention(c) (UnsafePointer<CChar>?) -> Void
-private typealias osr_init_t = @convention(c) () -> osr_plugin_ctx_t?
-private typealias osr_destroy_t = @convention(c) (osr_plugin_ctx_t?) -> Void
-private typealias osr_get_manifest_t = @convention(c) (osr_plugin_ctx_t?) -> UnsafePointer<CChar>?
-private typealias osr_invoke_t =
-  @convention(c) (
-    osr_plugin_ctx_t?,
-    UnsafePointer<CChar>?,  // type
-    UnsafePointer<CChar>?,  // id
-    UnsafePointer<CChar>?  // payload
-  ) -> UnsafePointer<CChar>?
-
-private struct osr_plugin_api {
-  var free_string: osr_free_string_t?
-  var `init`: osr_init_t?
-  var destroy: osr_destroy_t?
-  var get_manifest: osr_get_manifest_t?
-  var invoke: osr_invoke_t?
-}
-
 private class PluginContext {
   let getEventsTool = GetEventsTool()
   let searchEventsTool = SearchEventsTool()
@@ -515,33 +526,19 @@ private class PluginContext {
   let openEventTool = OpenEventTool()
 }
 
-private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
-  guard let ptr = strdup(s) else { return nil }
-  return UnsafePointer(ptr)
-}
-
-private var api: osr_plugin_api = {
-  var api = osr_plugin_api()
-
-  api.free_string = { ptr in
-    if let p = ptr { free(UnsafeMutableRawPointer(mutating: p)) }
-  }
-
-  api.`init` = {
-    let ctx = PluginContext()
-    return Unmanaged.passRetained(ctx).toOpaque()
-  }
-
-  api.destroy = { ctxPtr in
+private var pluginAPI = PluginEntry.makeAPI(
+  version: OsrABIVersion.v2,
+  init: {
+    Unmanaged.passRetained(PluginContext()).toOpaque()
+  },
+  destroy: { ctxPtr in
     guard let ctxPtr = ctxPtr else { return }
     Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
-  }
-
-  api.get_manifest = { ctxPtr in
-    return makeCString(calendarManifestJSON)
-  }
-
-  api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
+  },
+  getManifest: { _ in
+    osrMakeCString(calendarManifestJSON)
+  },
+  invoke: { ctxPtr, typePtr, idPtr, payloadPtr in
     guard let ctxPtr = ctxPtr,
       let typePtr = typePtr,
       let idPtr = idPtr,
@@ -554,32 +551,30 @@ private var api: osr_plugin_api = {
     let payload = String(cString: payloadPtr)
 
     guard type == "tool" else {
-      return makeCString(Envelope.failure(.invalidArgs, "Unknown capability type: \(type)"))
+      return osrMakeCString(Envelope.failure(.invalidArgs, "Unknown capability type: \(type)"))
     }
 
     switch id {
     case ctx.getEventsTool.name:
-      return makeCString(ctx.getEventsTool.run(args: payload))
+      return osrMakeCString(ctx.getEventsTool.run(args: payload))
     case ctx.searchEventsTool.name:
-      return makeCString(ctx.searchEventsTool.run(args: payload))
+      return osrMakeCString(ctx.searchEventsTool.run(args: payload))
     case ctx.createEventTool.name:
-      return makeCString(ctx.createEventTool.run(args: payload))
+      return osrMakeCString(ctx.createEventTool.run(args: payload))
     case ctx.openEventTool.name:
-      return makeCString(ctx.openEventTool.run(args: payload))
+      return osrMakeCString(ctx.openEventTool.run(args: payload))
     default:
-      return makeCString(Envelope.failure(.notFound, "Unknown tool: \(id)"))
+      return osrMakeCString(Envelope.failure(.notFound, "Unknown tool: \(id)"))
     }
   }
-
-  return api
-}()
+)
 
 /// File-scope manifest JSON embedded by the plugin. Referenced from `get_manifest`.
 let calendarManifestJSON = """
       {
         "plugin_id": "osaurus.calendar",
         "name": "Calendar",
-        "version": "1.0.5",
+        "version": "1.0.10",
         "description": "A calendar plugin for macOS Calendar.app integration",
         "license": "MIT",
         "authors": ["Osaurus"],
@@ -701,7 +696,12 @@ let calendarManifestJSON = """
       }
       """
 
+@_cdecl("osaurus_plugin_entry_v2")
+public func osaurus_plugin_entry_v2(_ host: UnsafeRawPointer?) -> UnsafeRawPointer? {
+  PluginEntry.enterV2(host, api: &pluginAPI)
+}
+
 @_cdecl("osaurus_plugin_entry")
 public func osaurus_plugin_entry() -> UnsafeRawPointer? {
-  return UnsafeRawPointer(&api)
+  PluginEntry.enterV1(api: &pluginAPI)
 }
