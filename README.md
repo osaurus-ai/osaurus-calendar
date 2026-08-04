@@ -21,13 +21,32 @@ This plugin provides fast and reliable calendar access using Apple's native `Eve
 
 ## Tools
 
+### `list_calendars`
+
+List all calendars with their account name, writability, and which one is the default. Useful when multiple accounts are configured (e.g. iCloud + Google) and calendar names are duplicated across accounts.
+
+**Parameters:** none
+
+**Example response:**
+
+```json
+[
+  {
+    "title": "Work",
+    "accountName": "iCloud",
+    "isWritable": true,
+    "isDefault": true
+  }
+]
+```
+
 ### `get_events`
 
 Get calendar events in a specified date range using EventKit (fast).
 
 **Parameters:**
 
-- `limit` (optional): Maximum number of events to return (default: 10)
+- `limit` (optional): Maximum number of events to return (default: 50)
 - `fromDate` (optional): Start date in ISO format (default: today)
 - `toDate` (optional): End date in ISO format (default: 7 days from now)
 
@@ -48,7 +67,7 @@ Search for calendar events that match the search text (case-insensitive title ma
 **Parameters:**
 
 - `searchText` (required): Text to search for in event titles
-- `limit` (optional): Maximum number of events to return (default: 10)
+- `limit` (optional): Maximum number of events to return (default: 50)
 - `fromDate` (optional): Start date in ISO format (default: today)
 - `toDate` (optional): End date in ISO format (default: 30 days from now)
 
@@ -73,7 +92,8 @@ Create a new calendar event.
 - `location` (optional): Location of the event
 - `notes` (optional): Notes/description for the event
 - `isAllDay` (optional): Whether this is an all-day event (default: false)
-- `calendarName` (optional): Name of the calendar to add the event to (default: first available calendar)
+- `calendarName` (optional): Name of the calendar to add the event to (default: the system default calendar). An unknown name is an error, and a name that exists in multiple accounts must be disambiguated with `accountName`.
+- `accountName` (optional): Account (source) the calendar belongs to, e.g. `iCloud` or `Google`. Use `list_calendars` to see accounts.
 
 **Example:**
 
@@ -137,21 +157,31 @@ This creates `osaurus.calendar-0.1.0.zip` for distribution.
 
 ## Response Format
 
-### Event Object
+### Event List Response
 
-All event-related tools return events in this format:
+`get_events` and `search_events` return an object with the matched events plus truncation metadata, so a clipped list is never mistaken for the complete set. Event dates are in the user's local time zone (ISO 8601 with UTC offset).
 
 ```json
 {
-  "id": "unique-event-id",
-  "title": "Event Title",
-  "location": "Event Location",
-  "notes": "Event notes/description",
-  "startDate": "2024-01-15 09:00:00",
-  "endDate": "2024-01-15 10:00:00",
-  "calendarName": "Work",
-  "isAllDay": false,
-  "url": "https://example.com"
+  "events": [
+    {
+      "id": "unique-event-id",
+      "title": "Event Title",
+      "location": "Event Location",
+      "notes": "Event notes/description",
+      "startDate": "2024-01-15T09:00:00+05:30",
+      "endDate": "2024-01-15T10:00:00+05:30",
+      "calendarName": "Work",
+      "isAllDay": false,
+      "url": "https://example.com"
+    }
+  ],
+  "returned": 1,
+  "totalInRange": 1,
+  "truncated": false,
+  "rangeStart": "2024-01-15T00:00:00+05:30",
+  "rangeEnd": "2024-01-22T00:00:00+05:30",
+  "note": null
 }
 ```
 
@@ -160,7 +190,7 @@ All event-related tools return events in this format:
 ```json
 {
   "success": true,
-  "message": "Event \"Team Standup\" created successfully.",
+  "message": "Event \"Team Standup\" created in calendar \"Work\" (iCloud).",
   "eventId": "ABC123-DEF456-GHI789"
 }
 ```

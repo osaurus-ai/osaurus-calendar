@@ -100,6 +100,39 @@ private struct CalendarEvent: Codable {
   let url: String?
 }
 
+/// List-style responses carry the full match count so a truncated result is
+/// visible to the model instead of silently reading as "these are all the
+/// events" (small models otherwise report a clipped list as complete).
+private struct EventListResponse: Codable {
+  let events: [CalendarEvent]
+  let returned: Int
+  let totalInRange: Int
+  let truncated: Bool
+  let rangeStart: String
+  let rangeEnd: String
+  let note: String?
+}
+
+private func makeEventListResponse(
+  matching: [EKEvent], limit: Int, startDate: Date, endDate: Date
+) -> String {
+  let sorted = matching.sorted { $0.startDate < $1.startDate }
+  let clipped = sorted.prefix(limit).map(mapEvent)
+  let truncated = sorted.count > clipped.count
+  return encodeJSON(
+    EventListResponse(
+      events: clipped,
+      returned: clipped.count,
+      totalInRange: sorted.count,
+      truncated: truncated,
+      rangeStart: isoDateFormatter.string(from: startDate),
+      rangeEnd: isoDateFormatter.string(from: endDate),
+      note: truncated
+        ? "Only \(clipped.count) of \(sorted.count) events shown. Pass a higher 'limit' to get the rest."
+        : nil
+    ))
+}
+
 // MARK: - Date Parsing
 
 private let isoDateFormatter: ISO8601DateFormatter = {
@@ -107,6 +140,10 @@ private let isoDateFormatter: ISO8601DateFormatter = {
   formatter.formatOptions = [
     .withInternetDateTime, .withDashSeparatorInDate, .withColonSeparatorInTime,
   ]
+  // Emit dates in the user's local time zone (with UTC offset) rather than
+  // "Z"/UTC, so listed event times match what Calendar.app shows. Parsing is
+  // unaffected: input strings carry their own offset.
+  formatter.timeZone = TimeZone.current
   return formatter
 }()
 
@@ -138,7 +175,45 @@ private func mapEvent(_ event: EKEvent) -> CalendarEvent {
   )
 }
 
+// MARK: - Calendar Model
+
+private struct CalendarInfo: Codable {
+  let title: String
+  let accountName: String
+  let isWritable: Bool
+  let isDefault: Bool
+}
+
+private func mapCalendar(_ calendar: EKCalendar, defaultId: String?) -> CalendarInfo {
+  CalendarInfo(
+    title: calendar.title,
+    accountName: calendar.source?.title ?? "Unknown",
+    isWritable: calendar.allowsContentModifications,
+    isDefault: calendar.calendarIdentifier == defaultId
+  )
+}
+
 // MARK: - Calendar Tools
+
+private struct ListCalendarsTool {
+  let name = "list_calendars"
+
+  func run(args: String) -> String {
+    if let failure = calendarAccessFailure(CalendarManager.shared.ensureAccess()) {
+      return failure
+    }
+
+    let store = CalendarManager.shared.store
+    let defaultId = store.defaultCalendarForNewEvents?.calendarIdentifier
+    let calendars = store.calendars(for: .event)
+      .sorted {
+        ($0.source?.title ?? "", $0.title) < ($1.source?.title ?? "", $1.title)
+      }
+      .map { mapCalendar($0, defaultId: defaultId) }
+
+    return encodeJSON(calendars)
+  }
+}
 
 private struct GetEventsTool {
   let name = "get_events"
@@ -184,7 +259,7 @@ private struct GetEventsTool {
     }
 
     let limit: Int
-    switch Validation.resolveLimit(input.limit, default: 10) {
+    switch Validation.resolveLimit(input.limit, default: 50) {
     case .ok(let value): limit = value
     case .invalid(let message): return Envelope.failure(.invalidArgs, message)
     }
@@ -196,13 +271,8 @@ private struct GetEventsTool {
       return Envelope.failure(.timeout, "Calendar query timed out")
     }
 
-    let eventModels =
-      allEvents
-      .sorted { $0.startDate < $1.startDate }
-      .prefix(limit)
-      .map(mapEvent)
-
-    return encodeJSON(eventModels)
+    return makeEventListResponse(
+      matching: allEvents, limit: limit, startDate: startDate, endDate: endDate)
   }
 }
 
@@ -256,7 +326,7 @@ private struct SearchEventsTool {
 
     let searchText = input.searchText.lowercased()
     let limit: Int
-    switch Validation.resolveLimit(input.limit, default: 10) {
+    switch Validation.resolveLimit(input.limit, default: 50) {
     case .ok(let value): limit = value
     case .invalid(let message): return Envelope.failure(.invalidArgs, message)
     }
@@ -268,14 +338,9 @@ private struct SearchEventsTool {
       return Envelope.failure(.timeout, "Calendar query timed out")
     }
 
-    let eventModels =
-      allEvents
-      .filter { $0.title.lowercased().contains(searchText) }
-      .sorted { $0.startDate < $1.startDate }
-      .prefix(limit)
-      .map(mapEvent)
-
-    return encodeJSON(eventModels)
+    let matching = allEvents.filter { $0.title.lowercased().contains(searchText) }
+    return makeEventListResponse(
+      matching: matching, limit: limit, startDate: startDate, endDate: endDate)
   }
 }
 
@@ -290,6 +355,74 @@ private struct CreateEventTool {
     let notes: String?
     let isAllDay: Bool?
     let calendarName: String?
+    let accountName: String?
+  }
+
+  /// Resolves the target calendar for the new event, or returns a failure
+  /// envelope. With two or more accounts, calendar titles are often
+  /// duplicated across accounts ("Home", "Work"), so a bare title match can
+  /// silently target the wrong account or a read-only calendar. Resolution
+  /// is explicit: an unmatched name is an error (never a silent fallback to
+  /// the default calendar), and an ambiguous name asks for `accountName`.
+  private func resolveCalendar(store: EKEventStore, input: Args) -> Result<EKCalendar, String> {
+    guard let calendarName = input.calendarName else {
+      if let accountName = input.accountName {
+        let matches = store.calendars(for: .event)
+          .filter { $0.source?.title == accountName && $0.allowsContentModifications }
+        if let cal = matches.first, matches.count == 1 {
+          return .success(cal)
+        }
+        return .failure(
+          Envelope.failure(
+            .invalidArgs,
+            matches.isEmpty
+              ? "No writable calendar found for account '\(accountName)'. Use list_calendars to see available calendars."
+              : "Account '\(accountName)' has multiple writable calendars. Specify 'calendarName': \(matches.map { $0.title }.joined(separator: ", "))"
+          ))
+      }
+      guard let cal = store.defaultCalendarForNewEvents else {
+        return .failure(
+          Envelope.failure(
+            .executionError,
+            "No default calendar is configured. Specify 'calendarName' (use list_calendars to see available calendars).",
+            retryable: false))
+      }
+      return .success(cal)
+    }
+
+    var matches = store.calendars(for: .event).filter { $0.title == calendarName }
+    if let accountName = input.accountName {
+      matches = matches.filter { $0.source?.title == accountName }
+    }
+
+    guard !matches.isEmpty else {
+      let scope = input.accountName.map { " in account '\($0)'" } ?? ""
+      return .failure(
+        Envelope.failure(
+          .notFound,
+          "Calendar '\(calendarName)' not found\(scope). Use list_calendars to see available calendars."
+        ))
+    }
+
+    let writable = matches.filter { $0.allowsContentModifications }
+    guard !writable.isEmpty else {
+      return .failure(
+        Envelope.failure(
+          .permissionDenied,
+          "Calendar '\(calendarName)' is read-only. Use list_calendars to find a writable calendar."
+        ))
+    }
+
+    guard writable.count == 1 else {
+      let accounts = writable.map { $0.source?.title ?? "Unknown" }.joined(separator: ", ")
+      return .failure(
+        Envelope.failure(
+          .invalidArgs,
+          "Multiple calendars named '\(calendarName)' exist (accounts: \(accounts)). Specify 'accountName' to disambiguate."
+        ))
+    }
+
+    return .success(writable[0])
   }
 
   func run(args: String) -> String {
@@ -324,28 +457,26 @@ private struct CreateEventTool {
     }
 
     let store = CalendarManager.shared.store
-    let event = EKEvent(eventStore: store)
 
+    let calendar: EKCalendar
+    switch resolveCalendar(store: store, input: input) {
+    case .success(let cal): calendar = cal
+    case .failure(let envelope): return envelope
+    }
+
+    let event = EKEvent(eventStore: store)
     event.title = input.title
     event.startDate = startDate
     event.endDate = endDate
     event.location = input.location
     event.notes = input.notes
     event.isAllDay = input.isAllDay ?? false
-
-    // Use the specified calendar, falling back to default if not found
-    if let calendarName = input.calendarName,
-      let cal = store.calendars(for: .event).first(where: { $0.title == calendarName })
-    {
-      event.calendar = cal
-    } else {
-      event.calendar = store.defaultCalendarForNewEvents
-    }
+    event.calendar = calendar
 
     do {
       try store.save(event, span: .thisEvent)
       return
-        "{\"success\": true, \"message\": \"Event \\\"\(escapeJSON(input.title))\\\" created successfully.\", \"eventId\": \"\(escapeJSON(event.eventIdentifier))\"}"
+        "{\"success\": true, \"message\": \"Event \\\"\(escapeJSON(input.title))\\\" created in calendar \\\"\(escapeJSON(calendar.title))\\\" (\(escapeJSON(calendar.source?.title ?? "Unknown"))).\", \"eventId\": \"\(escapeJSON(event.eventIdentifier ?? ""))\"}"
     } catch {
       return Envelope.failure(.executionError, error.localizedDescription)
     }
@@ -520,6 +651,7 @@ private func encodeJSON<T: Encodable>(_ value: T) -> String {
 // MARK: - C ABI Surface
 
 private class PluginContext {
+  let listCalendarsTool = ListCalendarsTool()
   let getEventsTool = GetEventsTool()
   let searchEventsTool = SearchEventsTool()
   let createEventTool = CreateEventTool()
@@ -555,6 +687,8 @@ private var pluginAPI = PluginEntry.makeAPI(
     }
 
     switch id {
+    case ctx.listCalendarsTool.name:
+      return osrMakeCString(ctx.listCalendarsTool.run(args: payload))
     case ctx.getEventsTool.name:
       return osrMakeCString(ctx.getEventsTool.run(args: payload))
     case ctx.searchEventsTool.name:
@@ -574,7 +708,7 @@ let calendarManifestJSON = """
       {
         "plugin_id": "osaurus.calendar",
         "name": "Calendar",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "description": "A calendar plugin for macOS Calendar.app integration",
         "license": "MIT",
         "authors": ["Osaurus"],
@@ -583,23 +717,34 @@ let calendarManifestJSON = """
         "capabilities": {
           "tools": [
             {
+              "id": "list_calendars",
+              "description": "List all calendars with their account name, writability, and which one is the default. Use this before create_event when the user has multiple accounts or the target calendar is ambiguous.",
+              "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              },
+              "requirements": ["calendar"],
+              "permission_policy": "auto"
+            },
+            {
               "id": "get_events",
               "widget": true,
-              "description": "Get calendar events in a specified date range",
+              "description": "Get calendar events in a date range. Always set fromDate and toDate to cover the exact period the user asked for (a week, a month, specific days); without them only the next 7 days are returned. Dates in results are in the user's local time zone. The response includes totalInRange and truncated so you can tell if the list is complete.",
               "parameters": {
                 "type": "object",
                 "properties": {
                   "limit": {
                     "type": "integer",
-                    "description": "Maximum number of events to return (default: 10)"
+                    "description": "Maximum number of events to return (default: 50)"
                   },
                   "fromDate": {
                     "type": "string",
-                    "description": "Start date for search range in ISO format (default: today)"
+                    "description": "Start of the range, ISO format (YYYY-MM-DD or full timestamp). Default: today. Set this explicitly for requests like 'this month'."
                   },
                   "toDate": {
                     "type": "string",
-                    "description": "End date for search range in ISO format (default: 7 days from now)"
+                    "description": "End of the range, ISO format. Default: 7 days from now. Set this explicitly for requests like 'this month'."
                   }
                 },
                 "required": []
@@ -609,7 +754,7 @@ let calendarManifestJSON = """
             },
             {
               "id": "search_events",
-              "description": "Search for calendar events that match the search text",
+              "description": "Search for calendar events whose title matches the search text. Set fromDate/toDate to cover the period the user asked for (default range: today to 30 days out). Dates in results are in the user's local time zone.",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -619,7 +764,7 @@ let calendarManifestJSON = """
                   },
                   "limit": {
                     "type": "integer",
-                    "description": "Maximum number of events to return (default: 10)"
+                    "description": "Maximum number of events to return (default: 50)"
                   },
                   "fromDate": {
                     "type": "string",
@@ -667,7 +812,11 @@ let calendarManifestJSON = """
                   },
                   "calendarName": {
                     "type": "string",
-                    "description": "Name of the calendar to add the event to (default: uses first calendar)"
+                    "description": "Name of the calendar to add the event to (default: the system default calendar). If the name exists in multiple accounts, also pass accountName."
+                  },
+                  "accountName": {
+                    "type": "string",
+                    "description": "Account (source) the calendar belongs to, e.g. 'iCloud' or 'Google'. Use list_calendars to see accounts."
                   }
                 },
                 "required": ["title", "startDate", "endDate"]
