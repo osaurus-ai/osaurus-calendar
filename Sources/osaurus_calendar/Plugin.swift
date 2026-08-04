@@ -364,7 +364,13 @@ private struct CreateEventTool {
   /// silently target the wrong account or a read-only calendar. Resolution
   /// is explicit: an unmatched name is an error (never a silent fallback to
   /// the default calendar), and an ambiguous name asks for `accountName`.
-  private func resolveCalendar(store: EKEventStore, input: Args) -> Result<EKCalendar, String> {
+  private enum CalendarResolution {
+    case success(EKCalendar)
+    /// Carries a ready-to-return failure envelope JSON string.
+    case failure(String)
+  }
+
+  private func resolveCalendar(store: EKEventStore, input: Args) -> CalendarResolution {
     guard let calendarName = input.calendarName else {
       if let accountName = input.accountName {
         let matches = store.calendars(for: .event)
