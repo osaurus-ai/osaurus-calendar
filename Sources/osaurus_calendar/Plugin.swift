@@ -100,6 +100,39 @@ private struct CalendarEvent: Codable {
   let url: String?
 }
 
+/// List-style responses carry the full match count so a truncated result is
+/// visible to the model instead of silently reading as "these are all the
+/// events" (small models otherwise report a clipped list as complete).
+private struct EventListResponse: Codable {
+  let events: [CalendarEvent]
+  let returned: Int
+  let totalInRange: Int
+  let truncated: Bool
+  let rangeStart: String
+  let rangeEnd: String
+  let note: String?
+}
+
+private func makeEventListResponse(
+  matching: [EKEvent], limit: Int, startDate: Date, endDate: Date
+) -> String {
+  let sorted = matching.sorted { $0.startDate < $1.startDate }
+  let clipped = sorted.prefix(limit).map(mapEvent)
+  let truncated = sorted.count > clipped.count
+  return encodeJSON(
+    EventListResponse(
+      events: clipped,
+      returned: clipped.count,
+      totalInRange: sorted.count,
+      truncated: truncated,
+      rangeStart: isoDateFormatter.string(from: startDate),
+      rangeEnd: isoDateFormatter.string(from: endDate),
+      note: truncated
+        ? "Only \(clipped.count) of \(sorted.count) events shown. Pass a higher 'limit' to get the rest."
+        : nil
+    ))
+}
+
 // MARK: - Date Parsing
 
 private let isoDateFormatter: ISO8601DateFormatter = {
@@ -107,6 +140,10 @@ private let isoDateFormatter: ISO8601DateFormatter = {
   formatter.formatOptions = [
     .withInternetDateTime, .withDashSeparatorInDate, .withColonSeparatorInTime,
   ]
+  // Emit dates in the user's local time zone (with UTC offset) rather than
+  // "Z"/UTC, so listed event times match what Calendar.app shows. Parsing is
+  // unaffected: input strings carry their own offset.
+  formatter.timeZone = TimeZone.current
   return formatter
 }()
 
@@ -222,7 +259,7 @@ private struct GetEventsTool {
     }
 
     let limit: Int
-    switch Validation.resolveLimit(input.limit, default: 10) {
+    switch Validation.resolveLimit(input.limit, default: 50) {
     case .ok(let value): limit = value
     case .invalid(let message): return Envelope.failure(.invalidArgs, message)
     }
@@ -234,13 +271,8 @@ private struct GetEventsTool {
       return Envelope.failure(.timeout, "Calendar query timed out")
     }
 
-    let eventModels =
-      allEvents
-      .sorted { $0.startDate < $1.startDate }
-      .prefix(limit)
-      .map(mapEvent)
-
-    return encodeJSON(eventModels)
+    return makeEventListResponse(
+      matching: allEvents, limit: limit, startDate: startDate, endDate: endDate)
   }
 }
 
@@ -294,7 +326,7 @@ private struct SearchEventsTool {
 
     let searchText = input.searchText.lowercased()
     let limit: Int
-    switch Validation.resolveLimit(input.limit, default: 10) {
+    switch Validation.resolveLimit(input.limit, default: 50) {
     case .ok(let value): limit = value
     case .invalid(let message): return Envelope.failure(.invalidArgs, message)
     }
@@ -306,14 +338,9 @@ private struct SearchEventsTool {
       return Envelope.failure(.timeout, "Calendar query timed out")
     }
 
-    let eventModels =
-      allEvents
-      .filter { $0.title.lowercased().contains(searchText) }
-      .sorted { $0.startDate < $1.startDate }
-      .prefix(limit)
-      .map(mapEvent)
-
-    return encodeJSON(eventModels)
+    let matching = allEvents.filter { $0.title.lowercased().contains(searchText) }
+    return makeEventListResponse(
+      matching: matching, limit: limit, startDate: startDate, endDate: endDate)
   }
 }
 
@@ -703,21 +730,21 @@ let calendarManifestJSON = """
             {
               "id": "get_events",
               "widget": true,
-              "description": "Get calendar events in a specified date range",
+              "description": "Get calendar events in a date range. Always set fromDate and toDate to cover the exact period the user asked for (a week, a month, specific days); without them only the next 7 days are returned. Dates in results are in the user's local time zone. The response includes totalInRange and truncated so you can tell if the list is complete.",
               "parameters": {
                 "type": "object",
                 "properties": {
                   "limit": {
                     "type": "integer",
-                    "description": "Maximum number of events to return (default: 10)"
+                    "description": "Maximum number of events to return (default: 50)"
                   },
                   "fromDate": {
                     "type": "string",
-                    "description": "Start date for search range in ISO format (default: today)"
+                    "description": "Start of the range, ISO format (YYYY-MM-DD or full timestamp). Default: today. Set this explicitly for requests like 'this month'."
                   },
                   "toDate": {
                     "type": "string",
-                    "description": "End date for search range in ISO format (default: 7 days from now)"
+                    "description": "End of the range, ISO format. Default: 7 days from now. Set this explicitly for requests like 'this month'."
                   }
                 },
                 "required": []
@@ -727,7 +754,7 @@ let calendarManifestJSON = """
             },
             {
               "id": "search_events",
-              "description": "Search for calendar events that match the search text",
+              "description": "Search for calendar events whose title matches the search text. Set fromDate/toDate to cover the period the user asked for (default range: today to 30 days out). Dates in results are in the user's local time zone.",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -737,7 +764,7 @@ let calendarManifestJSON = """
                   },
                   "limit": {
                     "type": "integer",
-                    "description": "Maximum number of events to return (default: 10)"
+                    "description": "Maximum number of events to return (default: 50)"
                   },
                   "fromDate": {
                     "type": "string",

@@ -46,7 +46,7 @@ Get calendar events in a specified date range using EventKit (fast).
 
 **Parameters:**
 
-- `limit` (optional): Maximum number of events to return (default: 10)
+- `limit` (optional): Maximum number of events to return (default: 50)
 - `fromDate` (optional): Start date in ISO format (default: today)
 - `toDate` (optional): End date in ISO format (default: 7 days from now)
 
@@ -67,7 +67,7 @@ Search for calendar events that match the search text (case-insensitive title ma
 **Parameters:**
 
 - `searchText` (required): Text to search for in event titles
-- `limit` (optional): Maximum number of events to return (default: 10)
+- `limit` (optional): Maximum number of events to return (default: 50)
 - `fromDate` (optional): Start date in ISO format (default: today)
 - `toDate` (optional): End date in ISO format (default: 30 days from now)
 
@@ -157,21 +157,31 @@ This creates `osaurus.calendar-0.1.0.zip` for distribution.
 
 ## Response Format
 
-### Event Object
+### Event List Response
 
-All event-related tools return events in this format:
+`get_events` and `search_events` return an object with the matched events plus truncation metadata, so a clipped list is never mistaken for the complete set. Event dates are in the user's local time zone (ISO 8601 with UTC offset).
 
 ```json
 {
-  "id": "unique-event-id",
-  "title": "Event Title",
-  "location": "Event Location",
-  "notes": "Event notes/description",
-  "startDate": "2024-01-15 09:00:00",
-  "endDate": "2024-01-15 10:00:00",
-  "calendarName": "Work",
-  "isAllDay": false,
-  "url": "https://example.com"
+  "events": [
+    {
+      "id": "unique-event-id",
+      "title": "Event Title",
+      "location": "Event Location",
+      "notes": "Event notes/description",
+      "startDate": "2024-01-15T09:00:00+05:30",
+      "endDate": "2024-01-15T10:00:00+05:30",
+      "calendarName": "Work",
+      "isAllDay": false,
+      "url": "https://example.com"
+    }
+  ],
+  "returned": 1,
+  "totalInRange": 1,
+  "truncated": false,
+  "rangeStart": "2024-01-15T00:00:00+05:30",
+  "rangeEnd": "2024-01-22T00:00:00+05:30",
+  "note": null
 }
 ```
 
