@@ -22,7 +22,7 @@ final class CalendarManifestTests: XCTestCase {
 
   func testManifestVersionMatchesRelease() throws {
     let manifest = try decodeManifest()
-    XCTAssertEqual(manifest["version"] as? String, "1.1.0")
+    XCTAssertEqual(manifest["version"] as? String, "1.2.0")
   }
 
   // Per-tool id/description/parameters checks are now covered by
