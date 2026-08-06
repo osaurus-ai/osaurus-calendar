@@ -3,7 +3,8 @@ import Foundation
 /// Pure argument-validation helpers, kept framework-free so they can be unit
 /// tested without EventKit/TCC access.
 enum Validation {
-  static let maxLimit = 1000
+  static let defaultLimit = 50
+  static let maxLimit = 200
 
   enum LimitResult: Equatable {
     case ok(Int)

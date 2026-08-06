@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 @testable import osaurus_calendar
@@ -28,5 +29,23 @@ final class ValidationTests: XCTestCase {
   func testHugeLimitClamped() {
     XCTAssertEqual(
       Validation.resolveLimit(Int.max, default: 10), .ok(Validation.maxLimit))
+  }
+
+  func testEncodingFailureReturnsCanonicalFailureInsteadOfFakeResult() throws {
+    struct FailingValue: Encodable {
+      func encode(to encoder: Encoder) throws {
+        throw EncodingError.invalidValue(
+          "value",
+          EncodingError.Context(codingPath: [], debugDescription: "intentional"))
+      }
+    }
+
+    let json = encodeSuccess(FailingValue(), tool: "query_events")
+    let object = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+    XCTAssertEqual(object["ok"] as? Bool, false)
+    XCTAssertEqual(object["kind"] as? String, "execution_error")
+    XCTAssertEqual(object["retryable"] as? Bool, false)
+    XCTAssertEqual(object["tool"] as? String, "query_events")
   }
 }

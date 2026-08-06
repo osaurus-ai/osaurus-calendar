@@ -2,7 +2,7 @@
 
 An Osaurus plugin for interacting with macOS Calendar.app via **EventKit** (native framework) and AppleScript (for UI control).
 
-This plugin provides fast and reliable calendar access using Apple's native `EventKit` framework for fetching, searching, and creating events. It uses AppleScript only for opening specific events in the Calendar application.
+Version 2.0 exposes four strict, snake_case tools and returns canonical Osaurus envelopes. EventKit handles calendar reads and event creation; AppleScript is used only to open an event in Calendar.app.
 
 ## Prerequisites
 
@@ -10,7 +10,7 @@ This plugin provides fast and reliable calendar access using Apple's native `Eve
 
 1.  **Calendars Access** (Full Access):
 
-    - **Why**: Required for `get_events`, `search_events`, and `create_event` to read/write the database directly (fast).
+    - **Why**: Required for `list_calendars`, `query_events`, `create_event`, and `open_event`.
     - **How**: System Settings > Privacy & Security > Calendars > Toggle **ON** for your app.
     - _Host App Requirement_: `Info.plist` must include `NSCalendarsFullAccessUsageDescription` (macOS 14+) or `NSCalendarsUsageDescription`.
 
@@ -30,53 +30,45 @@ List all calendars with their account name, writability, and which one is the de
 **Example response:**
 
 ```json
-[
-  {
-    "title": "Work",
-    "accountName": "iCloud",
-    "isWritable": true,
-    "isDefault": true
-  }
-]
-```
-
-### `get_events`
-
-Get calendar events in a specified date range using EventKit (fast).
-
-**Parameters:**
-
-- `limit` (optional): Maximum number of events to return (default: 50)
-- `fromDate` (optional): Start date in ISO format (default: today)
-- `toDate` (optional): End date in ISO format (default: 7 days from now)
-
-**Example:**
-
-```json
 {
-  "limit": 5,
-  "fromDate": "2024-01-15",
-  "toDate": "2024-01-22"
+  "ok": true,
+  "tool": "list_calendars",
+  "result": {
+    "calendars": [
+      {
+        "calendar_id": "opaque-calendar-id",
+        "calendar_name": "Work",
+        "account_name": "iCloud",
+        "is_writable": true,
+        "is_default": true
+      }
+    ],
+    "returned_count": 1,
+    "total_count": 1,
+    "truncated": false
+  }
 }
 ```
 
-### `search_events`
+### `query_events`
 
-Search for calendar events that match the search text (case-insensitive title match).
+List events in an RFC 3339 range, optionally filtering event titles with a case-insensitive query.
 
 **Parameters:**
 
-- `searchText` (required): Text to search for in event titles
-- `limit` (optional): Maximum number of events to return (default: 50)
-- `fromDate` (optional): Start date in ISO format (default: today)
-- `toDate` (optional): End date in ISO format (default: 30 days from now)
+- `query` (optional): Non-empty title substring
+- `limit` (optional): Maximum results, from 1 through 200 (default: 50)
+- `range_start` (optional): RFC 3339 range start (default: current time)
+- `range_end` (optional): RFC 3339 range end (default: seven days from now)
 
 **Example:**
 
 ```json
 {
-  "searchText": "meeting",
-  "limit": 10
+  "query": "meeting",
+  "limit": 10,
+  "range_start": "2026-08-06T00:00:00-07:00",
+  "range_end": "2026-08-13T00:00:00-07:00"
 }
 ```
 
@@ -87,23 +79,25 @@ Create a new calendar event.
 **Parameters:**
 
 - `title` (required): Title of the event
-- `startDate` (required): Start date/time in ISO format (e.g., `2024-01-15T09:00:00Z`)
-- `endDate` (required): End date/time in ISO format (e.g., `2024-01-15T10:00:00Z`)
+- `start_at` (required): Start date/time as an RFC 3339 timestamp
+- `end_at` (required): End date/time as an RFC 3339 timestamp after `start_at`
 - `location` (optional): Location of the event
 - `notes` (optional): Notes/description for the event
-- `isAllDay` (optional): Whether this is an all-day event (default: false)
-- `calendarName` (optional): Name of the calendar to add the event to (default: the system default calendar). An unknown name is an error, and a name that exists in multiple accounts must be disambiguated with `accountName`.
-- `accountName` (optional): Account (source) the calendar belongs to, e.g. `iCloud` or `Google`. Use `list_calendars` to see accounts.
+- `is_all_day` (optional): Whether this is an all-day event (default: false)
+- `calendar_name` (optional): Calendar name (default: the system default calendar)
+- `account_name` (optional): Account returned by `list_calendars`; use it when calendar names are duplicated
 
 **Example:**
 
 ```json
 {
   "title": "Team Standup",
-  "startDate": "2024-01-15T09:00:00Z",
-  "endDate": "2024-01-15T09:30:00Z",
+  "start_at": "2026-08-06T09:00:00-07:00",
+  "end_at": "2026-08-06T09:30:00-07:00",
   "location": "Conference Room A",
-  "notes": "Daily sync meeting"
+  "notes": "Daily sync meeting",
+  "calendar_name": "Work",
+  "account_name": "iCloud"
 }
 ```
 
@@ -113,13 +107,13 @@ Open a specific calendar event in the Calendar app.
 
 **Parameters:**
 
-- `eventId` (required): ID of the event to open (obtained from `get_events` or `search_events`)
+- `event_id` (required): Stable ID obtained from `query_events` or `create_event`
 
 **Example:**
 
 ```json
 {
-  "eventId": "ABC123-DEF456-GHI789"
+  "event_id": "ABC123-DEF456-GHI789"
 }
 ```
 
@@ -150,47 +144,63 @@ codesign --force --options runtime --timestamp \
 ### Package and Distribute
 
 ```bash
-osaurus tools package osaurus.calendar 0.1.0
+osaurus tools package osaurus.calendar 2.0.0
 ```
 
-This creates `osaurus.calendar-0.1.0.zip` for distribution.
+This creates `osaurus.calendar-2.0.0.zip` for distribution.
 
 ## Response Format
 
 ### Event List Response
 
-`get_events` and `search_events` return an object with the matched events plus truncation metadata, so a clipped list is never mistaken for the complete set. Event dates are in the user's local time zone (ISO 8601 with UTC offset).
+`query_events` returns a canonical envelope. Event timestamps use RFC 3339 with the user's local UTC offset.
 
 ```json
 {
-  "events": [
-    {
-      "id": "unique-event-id",
-      "title": "Event Title",
-      "location": "Event Location",
-      "notes": "Event notes/description",
-      "startDate": "2024-01-15T09:00:00+05:30",
-      "endDate": "2024-01-15T10:00:00+05:30",
-      "calendarName": "Work",
-      "isAllDay": false,
-      "url": "https://example.com"
-    }
-  ],
-  "returned": 1,
-  "totalInRange": 1,
-  "truncated": false,
-  "rangeStart": "2024-01-15T00:00:00+05:30",
-  "rangeEnd": "2024-01-22T00:00:00+05:30",
-  "note": null
+  "ok": true,
+  "tool": "query_events",
+  "result": {
+    "events": [
+      {
+        "event_id": "unique-event-id",
+        "title": "Event Title",
+        "location": "Event Location",
+        "notes": "Event notes/description",
+        "start_at": "2026-08-06T09:00:00-07:00",
+        "end_at": "2026-08-06T10:00:00-07:00",
+        "calendar_id": "opaque-calendar-id",
+        "calendar_name": "Work",
+        "account_name": "iCloud",
+        "is_all_day": false,
+        "url": "https://example.com"
+      }
+    ],
+    "returned_count": 1,
+    "total_count": 1,
+    "truncated": false,
+    "range_start": "2026-08-06T00:00:00-07:00",
+    "range_end": "2026-08-13T00:00:00-07:00"
+  }
 }
 ```
 
 ### Create Event Response
 
+`create_event` returns the complete created event using the same event shape.
+
 ```json
 {
-  "success": true,
-  "message": "Event \"Team Standup\" created in calendar \"Work\" (iCloud).",
-  "eventId": "ABC123-DEF456-GHI789"
+  "ok": true,
+  "tool": "create_event",
+  "result": {
+    "event_id": "ABC123-DEF456-GHI789",
+    "title": "Team Standup",
+    "start_at": "2026-08-06T09:00:00-07:00",
+    "end_at": "2026-08-06T09:30:00-07:00",
+    "calendar_id": "opaque-calendar-id",
+    "calendar_name": "Work",
+    "account_name": "iCloud",
+    "is_all_day": false
+  }
 }
 ```

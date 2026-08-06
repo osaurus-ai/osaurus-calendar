@@ -73,31 +73,49 @@ private class CalendarManager {
 }
 
 /// Returns a failure envelope for non-granted access, or nil when granted.
-private func calendarAccessFailure(_ access: CalendarAccess) -> String? {
+private func calendarAccessFailure(_ access: CalendarAccess, tool: String) -> String? {
   switch access {
   case .granted:
     return nil
   case .denied:
     return Envelope.failure(
-      .permissionDenied,
-      "Calendar access denied. Enable it in System Settings > Privacy & Security > Calendars.")
+      .userDenied,
+      "Calendar access denied. Enable it in System Settings > Privacy & Security > Calendars.",
+      tool: tool)
   case .timedOut:
-    return Envelope.failure(.timeout, "Timed out waiting for Calendar permission")
+    return Envelope.failure(
+      .timeout, "Timed out waiting for Calendar permission", tool: tool)
   }
 }
 
 // MARK: - Calendar Event Model
 
 private struct CalendarEvent: Codable {
-  let id: String
+  let eventId: String
   let title: String
   let location: String?
   let notes: String?
-  let startDate: String?
-  let endDate: String?
+  let startAt: String
+  let endAt: String
+  let calendarId: String
   let calendarName: String
+  let accountName: String
   let isAllDay: Bool
   let url: String?
+
+  enum CodingKeys: String, CodingKey {
+    case eventId = "event_id"
+    case title
+    case location
+    case notes
+    case startAt = "start_at"
+    case endAt = "end_at"
+    case calendarId = "calendar_id"
+    case calendarName = "calendar_name"
+    case accountName = "account_name"
+    case isAllDay = "is_all_day"
+    case url
+  }
 }
 
 /// List-style responses carry the full match count so a truncated result is
@@ -105,41 +123,42 @@ private struct CalendarEvent: Codable {
 /// events" (small models otherwise report a clipped list as complete).
 private struct EventListResponse: Codable {
   let events: [CalendarEvent]
-  let returned: Int
-  let totalInRange: Int
+  let returnedCount: Int
+  let totalCount: Int
   let truncated: Bool
   let rangeStart: String
   let rangeEnd: String
-  let note: String?
+
+  enum CodingKeys: String, CodingKey {
+    case events
+    case returnedCount = "returned_count"
+    case totalCount = "total_count"
+    case truncated
+    case rangeStart = "range_start"
+    case rangeEnd = "range_end"
+  }
 }
 
 private func makeEventListResponse(
   matching: [EKEvent], limit: Int, startDate: Date, endDate: Date
-) -> String {
+) -> EventListResponse {
   let sorted = matching.sorted { $0.startDate < $1.startDate }
   let clipped = sorted.prefix(limit).map(mapEvent)
-  let truncated = sorted.count > clipped.count
-  return encodeJSON(
-    EventListResponse(
-      events: clipped,
-      returned: clipped.count,
-      totalInRange: sorted.count,
-      truncated: truncated,
-      rangeStart: isoDateFormatter.string(from: startDate),
-      rangeEnd: isoDateFormatter.string(from: endDate),
-      note: truncated
-        ? "Only \(clipped.count) of \(sorted.count) events shown. Pass a higher 'limit' to get the rest."
-        : nil
-    ))
+  return EventListResponse(
+    events: clipped,
+    returnedCount: clipped.count,
+    totalCount: sorted.count,
+    truncated: sorted.count > clipped.count,
+    rangeStart: rfc3339Formatter.string(from: startDate),
+    rangeEnd: rfc3339Formatter.string(from: endDate)
+  )
 }
 
 // MARK: - Date Parsing
 
-private let isoDateFormatter: ISO8601DateFormatter = {
+private let rfc3339Formatter: ISO8601DateFormatter = {
   let formatter = ISO8601DateFormatter()
-  formatter.formatOptions = [
-    .withInternetDateTime, .withDashSeparatorInDate, .withColonSeparatorInTime,
-  ]
+  formatter.formatOptions = [.withInternetDateTime]
   // Emit dates in the user's local time zone (with UTC offset) rather than
   // "Z"/UTC, so listed event times match what Calendar.app shows. Parsing is
   // unaffected: input strings carry their own offset.
@@ -147,29 +166,29 @@ private let isoDateFormatter: ISO8601DateFormatter = {
   return formatter
 }()
 
-private let simpleDateFormatter: DateFormatter = {
-  let formatter = DateFormatter()
-  formatter.dateFormat = "yyyy-MM-dd"
+private let fractionalRFC3339Formatter: ISO8601DateFormatter = {
+  let formatter = ISO8601DateFormatter()
+  formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
   return formatter
 }()
 
-private func parseDate(_ str: String) -> Date? {
-  if let date = isoDateFormatter.date(from: str) { return date }
-  if let date = simpleDateFormatter.date(from: str) { return date }
-  return nil
+private func parseRFC3339(_ value: String) -> Date? {
+  rfc3339Formatter.date(from: value) ?? fractionalRFC3339Formatter.date(from: value)
 }
 
 // MARK: - Event Mapping
 
 private func mapEvent(_ event: EKEvent) -> CalendarEvent {
   CalendarEvent(
-    id: event.eventIdentifier,
+    eventId: event.eventIdentifier ?? event.calendarItemIdentifier,
     title: event.title,
     location: event.location,
     notes: event.notes,
-    startDate: isoDateFormatter.string(from: event.startDate),
-    endDate: isoDateFormatter.string(from: event.endDate),
+    startAt: rfc3339Formatter.string(from: event.startDate),
+    endAt: rfc3339Formatter.string(from: event.endDate),
+    calendarId: event.calendar.calendarIdentifier,
     calendarName: event.calendar.title,
+    accountName: event.calendar.source?.title ?? "Unknown",
     isAllDay: event.isAllDay,
     url: event.url?.absoluteString
   )
@@ -178,15 +197,39 @@ private func mapEvent(_ event: EKEvent) -> CalendarEvent {
 // MARK: - Calendar Model
 
 private struct CalendarInfo: Codable {
-  let title: String
+  let calendarId: String
+  let calendarName: String
   let accountName: String
   let isWritable: Bool
   let isDefault: Bool
+
+  enum CodingKeys: String, CodingKey {
+    case calendarId = "calendar_id"
+    case calendarName = "calendar_name"
+    case accountName = "account_name"
+    case isWritable = "is_writable"
+    case isDefault = "is_default"
+  }
+}
+
+private struct CalendarListResponse: Codable {
+  let calendars: [CalendarInfo]
+  let returnedCount: Int
+  let totalCount: Int
+  let truncated: Bool
+
+  enum CodingKeys: String, CodingKey {
+    case calendars
+    case returnedCount = "returned_count"
+    case totalCount = "total_count"
+    case truncated
+  }
 }
 
 private func mapCalendar(_ calendar: EKCalendar, defaultId: String?) -> CalendarInfo {
   CalendarInfo(
-    title: calendar.title,
+    calendarId: calendar.calendarIdentifier,
+    calendarName: calendar.title,
     accountName: calendar.source?.title ?? "Unknown",
     isWritable: calendar.allowsContentModifications,
     isDefault: calendar.calendarIdentifier == defaultId
@@ -197,150 +240,152 @@ private func mapCalendar(_ calendar: EKCalendar, defaultId: String?) -> Calendar
 
 private struct ListCalendarsTool {
   let name = "list_calendars"
+  private let maximumCalendars = 200
 
   func run(args: String) -> String {
-    if let failure = calendarAccessFailure(CalendarManager.shared.ensureAccess()) {
+    do {
+      _ = try decodeArgs(
+        EmptyArgs.self, from: args, allowedKeys: [], tool: name)
+    } catch {
+      return renderFailure(error, tool: name)
+    }
+
+    if let failure = calendarAccessFailure(
+      CalendarManager.shared.ensureAccess(), tool: name)
+    {
       return failure
     }
 
     let store = CalendarManager.shared.store
     let defaultId = store.defaultCalendarForNewEvents?.calendarIdentifier
-    let calendars = store.calendars(for: .event)
+    let allCalendars = store.calendars(for: .event)
       .sorted {
         ($0.source?.title ?? "", $0.title) < ($1.source?.title ?? "", $1.title)
       }
+    let calendars = allCalendars.prefix(maximumCalendars)
       .map { mapCalendar($0, defaultId: defaultId) }
+    let response = CalendarListResponse(
+      calendars: calendars,
+      returnedCount: calendars.count,
+      totalCount: allCalendars.count,
+      truncated: allCalendars.count > calendars.count)
 
-    return encodeJSON(calendars)
+    return encodeSuccess(response, tool: name)
   }
 }
 
-private struct GetEventsTool {
-  let name = "get_events"
+private struct QueryEventsTool {
+  let name = "query_events"
 
   struct Args: Decodable {
+    let query: String?
     let limit: Int?
-    let fromDate: String?
-    let toDate: String?
+    let rangeStart: String?
+    let rangeEnd: String?
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return Envelope.failure(.invalidArgs, "Invalid arguments: expected a JSON object")
+    let input: Args
+    do {
+      input = try decodeArgs(
+        Args.self,
+        from: args,
+        allowedKeys: ["query", "limit", "range_start", "range_end"],
+        tool: name)
+    } catch {
+      return renderFailure(error, tool: name)
     }
 
-    if let failure = calendarAccessFailure(CalendarManager.shared.ensureAccess()) {
-      return failure
-    }
-
-    let today = Date()
-    let defaultEndDate = Calendar.current.date(byAdding: .day, value: 7, to: today)!
-
-    var startDate = today
-    if let fromDate = input.fromDate {
-      guard let parsed = parseDate(fromDate) else {
-        return Envelope.failure(.invalidArgs, "Invalid date for field 'fromDate': \(fromDate)")
-      }
-      startDate = parsed
-    }
-
-    var endDate = defaultEndDate
-    if let toDate = input.toDate {
-      guard let parsed = parseDate(toDate) else {
-        return Envelope.failure(.invalidArgs, "Invalid date for field 'toDate': \(toDate)")
-      }
-      endDate = parsed
-    }
-
-    guard endDate >= startDate else {
-      return Envelope.failure(.invalidArgs, "toDate must be on or after fromDate")
+    let normalizedQuery = input.query?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if input.query != nil && normalizedQuery?.isEmpty != false {
+      return Envelope.failure(
+        .invalidArgs,
+        "query must not be empty when provided",
+        field: "query",
+        expected: "a non-empty string",
+        tool: name)
     }
 
     let limit: Int
-    switch Validation.resolveLimit(input.limit, default: 50) {
-    case .ok(let value): limit = value
-    case .invalid(let message): return Envelope.failure(.invalidArgs, message)
+    switch Validation.resolveLimit(input.limit, default: Validation.defaultLimit) {
+    case .ok(let value):
+      limit = value
+    case .invalid(let message):
+      return Envelope.failure(
+        .invalidArgs,
+        message,
+        field: "limit",
+        expected: "an integer from 1 through \(Validation.maxLimit)",
+        tool: name)
+    }
+
+    let now = Date()
+    let defaultEndDate = Calendar.current.date(byAdding: .day, value: 7, to: now)!
+    let startDate: Date
+    if let rangeStart = input.rangeStart {
+      guard let parsed = parseRFC3339(rangeStart) else {
+        return Envelope.failure(
+          .invalidArgs,
+          "range_start must be an RFC 3339 timestamp",
+          field: "range_start",
+          expected: "RFC 3339 date-time, for example 2026-08-06T09:00:00-07:00",
+          tool: name)
+      }
+      startDate = parsed
+    } else {
+      startDate = now
+    }
+
+    let endDate: Date
+    if let rangeEnd = input.rangeEnd {
+      guard let parsed = parseRFC3339(rangeEnd) else {
+        return Envelope.failure(
+          .invalidArgs,
+          "range_end must be an RFC 3339 timestamp",
+          field: "range_end",
+          expected: "RFC 3339 date-time, for example 2026-08-13T09:00:00-07:00",
+          tool: name)
+      }
+      endDate = parsed
+    } else {
+      endDate = defaultEndDate
+    }
+
+    guard endDate >= startDate else {
+      return Envelope.failure(
+        .invalidArgs,
+        "range_end must be on or after range_start",
+        field: "range_end",
+        expected: "a timestamp on or after range_start",
+        tool: name)
+    }
+
+    if let failure = calendarAccessFailure(
+      CalendarManager.shared.ensureAccess(), tool: name)
+    {
+      return failure
     }
 
     let store = CalendarManager.shared.store
     let predicate = store.predicateForEvents(withStart: startDate, end: endDate, calendars: nil)
 
     guard let allEvents = fetchEvents(store: store, predicate: predicate) else {
-      return Envelope.failure(.timeout, "Calendar query timed out")
+      return Envelope.failure(.timeout, "Calendar query timed out", tool: name)
     }
 
-    return makeEventListResponse(
-      matching: allEvents, limit: limit, startDate: startDate, endDate: endDate)
-  }
-}
-
-private struct SearchEventsTool {
-  let name = "search_events"
-
-  struct Args: Decodable {
-    let searchText: String
-    let limit: Int?
-    let fromDate: String?
-    let toDate: String?
-  }
-
-  func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return Envelope.failure(.invalidArgs, "Invalid arguments: expected a JSON object")
+    let matching: [EKEvent]
+    if let query = normalizedQuery?.lowercased() {
+      matching = allEvents.filter { $0.title.lowercased().contains(query) }
+    } else {
+      matching = allEvents
     }
-
-    guard !input.searchText.trimmingCharacters(in: .whitespaces).isEmpty else {
-      return Envelope.failure(.invalidArgs, "Missing required field 'searchText'")
-    }
-
-    if let failure = calendarAccessFailure(CalendarManager.shared.ensureAccess()) {
-      return failure
-    }
-
-    let today = Date()
-    let defaultEndDate = Calendar.current.date(byAdding: .day, value: 30, to: today)!
-
-    var startDate = today
-    if let fromDate = input.fromDate {
-      guard let parsed = parseDate(fromDate) else {
-        return Envelope.failure(.invalidArgs, "Invalid date for field 'fromDate': \(fromDate)")
-      }
-      startDate = parsed
-    }
-
-    var endDate = defaultEndDate
-    if let toDate = input.toDate {
-      guard let parsed = parseDate(toDate) else {
-        return Envelope.failure(.invalidArgs, "Invalid date for field 'toDate': \(toDate)")
-      }
-      endDate = parsed
-    }
-
-    guard endDate >= startDate else {
-      return Envelope.failure(.invalidArgs, "toDate must be on or after fromDate")
-    }
-
-    let searchText = input.searchText.lowercased()
-    let limit: Int
-    switch Validation.resolveLimit(input.limit, default: 50) {
-    case .ok(let value): limit = value
-    case .invalid(let message): return Envelope.failure(.invalidArgs, message)
-    }
-
-    let store = CalendarManager.shared.store
-    let predicate = store.predicateForEvents(withStart: startDate, end: endDate, calendars: nil)
-
-    guard let allEvents = fetchEvents(store: store, predicate: predicate) else {
-      return Envelope.failure(.timeout, "Calendar query timed out")
-    }
-
-    let matching = allEvents.filter { $0.title.lowercased().contains(searchText) }
-    return makeEventListResponse(
+    let response = makeEventListResponse(
       matching: matching, limit: limit, startDate: startDate, endDate: endDate)
+    let warnings =
+      response.truncated
+      ? ["Returned \(response.returnedCount) of \(response.totalCount) matching events."]
+      : []
+    return encodeSuccess(response, tool: name, warnings: warnings)
   }
 }
 
@@ -349,8 +394,8 @@ private struct CreateEventTool {
 
   struct Args: Decodable {
     let title: String
-    let startDate: String
-    let endDate: String
+    let startAt: String
+    let endAt: String
     let location: String?
     let notes: String?
     let isAllDay: Bool?
@@ -363,7 +408,7 @@ private struct CreateEventTool {
   /// duplicated across accounts ("Home", "Work"), so a bare title match can
   /// silently target the wrong account or a read-only calendar. Resolution
   /// is explicit: an unmatched name is an error (never a silent fallback to
-  /// the default calendar), and an ambiguous name asks for `accountName`.
+  /// the default calendar), and an ambiguous name asks for `account_name`.
   private enum CalendarResolution {
     case success(EKCalendar)
     /// Carries a ready-to-return failure envelope JSON string.
@@ -383,15 +428,16 @@ private struct CreateEventTool {
             .invalidArgs,
             matches.isEmpty
               ? "No writable calendar found for account '\(accountName)'. Use list_calendars to see available calendars."
-              : "Account '\(accountName)' has multiple writable calendars. Specify 'calendarName': \(matches.map { $0.title }.joined(separator: ", "))"
+              : "Account '\(accountName)' has multiple writable calendars. Specify calendar_name: \(matches.map { $0.title }.joined(separator: ", "))",
+            tool: name
           ))
       }
       guard let cal = store.defaultCalendarForNewEvents else {
         return .failure(
           Envelope.failure(
-            .executionError,
-            "No default calendar is configured. Specify 'calendarName' (use list_calendars to see available calendars).",
-            retryable: false))
+            .unavailable,
+            "No default calendar is configured. Specify calendar_name after calling list_calendars.",
+            tool: name))
       }
       return .success(cal)
     }
@@ -406,7 +452,8 @@ private struct CreateEventTool {
       return .failure(
         Envelope.failure(
           .notFound,
-          "Calendar '\(calendarName)' not found\(scope). Use list_calendars to see available calendars."
+          "Calendar '\(calendarName)' not found\(scope). Use list_calendars to see available calendars.",
+          tool: name
         ))
     }
 
@@ -414,8 +461,9 @@ private struct CreateEventTool {
     guard !writable.isEmpty else {
       return .failure(
         Envelope.failure(
-          .permissionDenied,
-          "Calendar '\(calendarName)' is read-only. Use list_calendars to find a writable calendar."
+          .rejected,
+          "Calendar '\(calendarName)' is read-only. Use list_calendars to find a writable calendar.",
+          tool: name
         ))
     }
 
@@ -424,7 +472,10 @@ private struct CreateEventTool {
       return .failure(
         Envelope.failure(
           .invalidArgs,
-          "Multiple calendars named '\(calendarName)' exist (accounts: \(accounts)). Specify 'accountName' to disambiguate."
+          "Multiple calendars named '\(calendarName)' exist (accounts: \(accounts)). Specify account_name to disambiguate.",
+          field: "account_name",
+          expected: "one of: \(accounts)",
+          tool: name
         ))
     }
 
@@ -432,34 +483,60 @@ private struct CreateEventTool {
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return Envelope.failure(.invalidArgs, "Invalid arguments: expected a JSON object")
+    let input: Args
+    do {
+      input = try decodeArgs(
+        Args.self,
+        from: args,
+        allowedKeys: [
+          "title", "start_at", "end_at", "location", "notes", "is_all_day",
+          "calendar_name", "account_name",
+        ],
+        tool: name)
+    } catch {
+      return renderFailure(error, tool: name)
     }
 
-    if let failure = calendarAccessFailure(CalendarManager.shared.ensureAccess()) {
-      return failure
-    }
-
-    guard !input.title.trimmingCharacters(in: .whitespaces).isEmpty else {
-      return Envelope.failure(.invalidArgs, "Missing required field 'title'")
-    }
-
-    guard let startDate = isoDateFormatter.date(from: input.startDate) else {
+    guard !input.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
       return Envelope.failure(
         .invalidArgs,
-        "Invalid date for field 'startDate': \(input.startDate). Use ISO format (YYYY-MM-DDTHH:mm:ssZ)")
+        "title must not be empty",
+        field: "title",
+        expected: "a non-empty string",
+        tool: name)
     }
 
-    guard let endDate = isoDateFormatter.date(from: input.endDate) else {
+    guard let startDate = parseRFC3339(input.startAt) else {
       return Envelope.failure(
         .invalidArgs,
-        "Invalid date for field 'endDate': \(input.endDate). Use ISO format (YYYY-MM-DDTHH:mm:ssZ)")
+        "start_at must be an RFC 3339 timestamp",
+        field: "start_at",
+        expected: "RFC 3339 date-time, for example 2026-08-06T09:00:00-07:00",
+        tool: name)
+    }
+
+    guard let endDate = parseRFC3339(input.endAt) else {
+      return Envelope.failure(
+        .invalidArgs,
+        "end_at must be an RFC 3339 timestamp",
+        field: "end_at",
+        expected: "RFC 3339 date-time, for example 2026-08-06T10:00:00-07:00",
+        tool: name)
     }
 
     guard endDate > startDate else {
-      return Envelope.failure(.invalidArgs, "endDate must be after startDate")
+      return Envelope.failure(
+        .invalidArgs,
+        "end_at must be after start_at",
+        field: "end_at",
+        expected: "a timestamp after start_at",
+        tool: name)
+    }
+
+    if let failure = calendarAccessFailure(
+      CalendarManager.shared.ensureAccess(), tool: name)
+    {
+      return failure
     }
 
     let store = CalendarManager.shared.store
@@ -481,10 +558,9 @@ private struct CreateEventTool {
 
     do {
       try store.save(event, span: .thisEvent)
-      return
-        "{\"success\": true, \"message\": \"Event \\\"\(escapeJSON(input.title))\\\" created in calendar \\\"\(escapeJSON(calendar.title))\\\" (\(escapeJSON(calendar.source?.title ?? "Unknown"))).\", \"eventId\": \"\(escapeJSON(event.eventIdentifier ?? ""))\"}"
+      return encodeSuccess(mapEvent(event), tool: name)
     } catch {
-      return Envelope.failure(.executionError, error.localizedDescription)
+      return Envelope.failure(.executionError, error.localizedDescription, tool: name)
     }
   }
 }
@@ -497,23 +573,33 @@ private struct OpenEventTool {
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return Envelope.failure(.invalidArgs, "Invalid arguments: expected a JSON object")
+    let input: Args
+    do {
+      input = try decodeArgs(
+        Args.self, from: args, allowedKeys: ["event_id"], tool: name)
+    } catch {
+      return renderFailure(error, tool: name)
     }
 
-    guard !input.eventId.trimmingCharacters(in: .whitespaces).isEmpty else {
-      return Envelope.failure(.invalidArgs, "Missing required field 'eventId'")
+    guard !input.eventId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return Envelope.failure(
+        .invalidArgs,
+        "event_id must not be empty",
+        field: "event_id",
+        expected: "a stable event_id returned by query_events or create_event",
+        tool: name)
     }
 
-    if let failure = calendarAccessFailure(CalendarManager.shared.ensureAccess()) {
+    if let failure = calendarAccessFailure(
+      CalendarManager.shared.ensureAccess(), tool: name)
+    {
       return failure
     }
 
     let store = CalendarManager.shared.store
     guard let event = store.event(withIdentifier: input.eventId) else {
-      return Envelope.failure(.notFound, "Event not found: \(input.eventId)")
+      return Envelope.failure(
+        .notFound, "Event not found: \(input.eventId)", tool: name)
     }
 
     let appleScriptDateFormatter = DateFormatter()
@@ -551,11 +637,21 @@ private struct OpenEventTool {
     // Run AppleScript via osascript process (thread-safe, with timeout)
     let result = runAppleScript(script)
     if result.success {
-      return "{\"success\": true, \"message\": \"Event opened successfully\"}"
+      return Envelope.success(
+        tool: name,
+        result: [
+          "event_id": eventId,
+          "opened": true,
+        ])
     } else if result.timedOut {
-      return Envelope.failure(.timeout, result.error)
+      return Envelope.failure(.timeout, result.error, tool: name)
+    } else if isAutomationDenied(result.error) {
+      return Envelope.failure(
+        .userDenied,
+        "Automation access to Calendar was denied. Enable it in System Settings > Privacy & Security > Automation.",
+        tool: name)
     } else {
-      return Envelope.failure(.executionError, result.error)
+      return Envelope.failure(.executionError, result.error, tool: name)
     }
   }
 }
@@ -586,6 +682,13 @@ private func runAppleScript(_ source: String, timeout: TimeInterval = 15) -> (
     output,
     result.timedOut ? "AppleScript timed out after \(Int(timeout)) seconds" : errOutput
   )
+}
+
+private func isAutomationDenied(_ message: String) -> Bool {
+  let normalized = message.lowercased()
+  return normalized.contains("-1743")
+    || normalized.contains("not authorized to send apple events")
+    || normalized.contains("not authorised to send apple events")
 }
 
 /// Fetches events from EventKit with a timeout to prevent blocking indefinitely.
@@ -633,33 +736,86 @@ private func escapeAppleScript(_ str: String) -> String {
     .replacingOccurrences(of: "\"", with: "\\\"")
 }
 
-private func escapeJSON(_ str: String) -> String {
-  return
-    str
-    .replacingOccurrences(of: "\\", with: "\\\\")
-    .replacingOccurrences(of: "\"", with: "\\\"")
-    .replacingOccurrences(of: "\n", with: "\\n")
-    .replacingOccurrences(of: "\r", with: "\\r")
-    .replacingOccurrences(of: "\t", with: "\\t")
+private struct EmptyArgs: Decodable {}
+
+private func decodeArgs<T: Decodable>(
+  _ type: T.Type,
+  from json: String,
+  allowedKeys: Set<String>,
+  tool: String
+) throws -> T {
+  let object = try ArgValidation.parseObject(json)
+  if let unknown = object.keys.filter({ !allowedKeys.contains($0) }).sorted().first {
+    throw EnvelopeFailure(
+      .invalidArgs,
+      "Unknown argument: \(unknown)",
+      field: unknown,
+      expected: "one of: \(allowedKeys.sorted().joined(separator: ", "))",
+      tool: tool)
+  }
+
+  do {
+    let data = try JSONSerialization.data(withJSONObject: object)
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    return try decoder.decode(type, from: data)
+  } catch {
+    throw EnvelopeFailure(
+      .invalidArgs,
+      "Arguments do not match the \(tool) contract",
+      tool: tool)
+  }
 }
 
-private func encodeJSON<T: Encodable>(_ value: T) -> String {
+private func renderFailure(_ error: Error, tool: String) -> String {
+  guard let failure = error as? EnvelopeFailure else {
+    return Envelope.failure(.executionError, error.localizedDescription, tool: tool)
+  }
+  return Envelope.failure(
+    failure.kind,
+    failure.message,
+    retryable: failure.retryable,
+    field: failure.field,
+    expected: failure.expected,
+    tool: failure.tool ?? tool,
+    dataJSON: failure.dataJSON)
+}
+
+private func encodeJSON<T: Encodable>(_ value: T) throws -> String {
   let encoder = JSONEncoder()
-  encoder.outputFormatting = .prettyPrinted
-  guard let data = try? encoder.encode(value),
-    let json = String(data: data, encoding: .utf8)
-  else {
-    return "[]"
+  encoder.outputFormatting = [.sortedKeys]
+  let data = try encoder.encode(value)
+  guard let json = String(data: data, encoding: .utf8) else {
+    throw EncodingError.invalidValue(
+      value,
+      EncodingError.Context(
+        codingPath: [], debugDescription: "Encoded JSON was not valid UTF-8"))
   }
   return json
+}
+
+func encodeSuccess<T: Encodable>(
+  _ value: T,
+  tool: String,
+  warnings: [String] = []
+) -> String {
+  do {
+    return Envelope.success(
+      tool: tool, rawResult: try encodeJSON(value), warnings: warnings)
+  } catch {
+    return Envelope.failure(
+      .executionError,
+      "Failed to encode \(tool) result: \(error.localizedDescription)",
+      retryable: false,
+      tool: tool)
+  }
 }
 
 // MARK: - C ABI Surface
 
 private class PluginContext {
   let listCalendarsTool = ListCalendarsTool()
-  let getEventsTool = GetEventsTool()
-  let searchEventsTool = SearchEventsTool()
+  let queryEventsTool = QueryEventsTool()
   let createEventTool = CreateEventTool()
   let openEventTool = OpenEventTool()
 }
@@ -689,22 +845,22 @@ private var pluginAPI = PluginEntry.makeAPI(
     let payload = String(cString: payloadPtr)
 
     guard type == "tool" else {
-      return osrMakeCString(Envelope.failure(.invalidArgs, "Unknown capability type: \(type)"))
+      return osrMakeCString(
+        Envelope.failure(.invalidArgs, "Unknown capability type: \(type)"))
     }
 
     switch id {
     case ctx.listCalendarsTool.name:
       return osrMakeCString(ctx.listCalendarsTool.run(args: payload))
-    case ctx.getEventsTool.name:
-      return osrMakeCString(ctx.getEventsTool.run(args: payload))
-    case ctx.searchEventsTool.name:
-      return osrMakeCString(ctx.searchEventsTool.run(args: payload))
+    case ctx.queryEventsTool.name:
+      return osrMakeCString(ctx.queryEventsTool.run(args: payload))
     case ctx.createEventTool.name:
       return osrMakeCString(ctx.createEventTool.run(args: payload))
     case ctx.openEventTool.name:
       return osrMakeCString(ctx.openEventTool.run(args: payload))
     default:
-      return osrMakeCString(Envelope.failure(.notFound, "Unknown tool: \(id)"))
+      return osrMakeCString(
+        Envelope.failure(.toolNotFound, "Unknown tool: \(id)", tool: id))
     }
   }
 )
@@ -714,8 +870,8 @@ let calendarManifestJSON = """
       {
         "plugin_id": "osaurus.calendar",
         "name": "Calendar",
-        "version": "1.2.0",
-        "description": "A calendar plugin for macOS Calendar.app integration",
+        "version": "2.0.0",
+        "description": "Read, create, and open events in macOS Calendar.app",
         "license": "MIT",
         "authors": ["Osaurus"],
         "min_macos": "13.0",
@@ -724,108 +880,98 @@ let calendarManifestJSON = """
           "tools": [
             {
               "id": "list_calendars",
-              "description": "List all calendars with their account name, writability, and which one is the default. Use this before create_event when the user has multiple accounts or the target calendar is ambiguous.",
+              "description": "List up to 200 calendars with stable IDs, account names, writability, default status, and collection metadata.",
               "parameters": {
                 "type": "object",
                 "properties": {},
-                "required": []
+                "required": [],
+                "additionalProperties": false
               },
               "requirements": ["calendar"],
               "permission_policy": "auto"
             },
             {
-              "id": "get_events",
-              "widget": true,
-              "description": "Get calendar events in a date range. Always set fromDate and toDate to cover the exact period the user asked for (a week, a month, specific days); without them only the next 7 days are returned. Dates in results are in the user's local time zone. The response includes totalInRange and truncated so you can tell if the list is complete.",
+              "id": "query_events",
+              "description": "List events in an RFC 3339 range, optionally filtering titles by a case-insensitive query. Returns stable IDs, local-offset RFC 3339 timestamps, account names, and bounded collection metadata.",
               "parameters": {
                 "type": "object",
                 "properties": {
-                  "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of events to return (default: 50)"
-                  },
-                  "fromDate": {
+                  "query": {
                     "type": "string",
-                    "description": "Start of the range, ISO format (YYYY-MM-DD or full timestamp). Default: today. Set this explicitly for requests like 'this month'."
-                  },
-                  "toDate": {
-                    "type": "string",
-                    "description": "End of the range, ISO format. Default: 7 days from now. Set this explicitly for requests like 'this month'."
-                  }
-                },
-                "required": []
-              },
-              "requirements": ["calendar"],
-              "permission_policy": "auto"
-            },
-            {
-              "id": "search_events",
-              "description": "Search for calendar events whose title matches the search text. Set fromDate/toDate to cover the period the user asked for (default range: today to 30 days out). Dates in results are in the user's local time zone.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "searchText": {
-                    "type": "string",
-                    "description": "Text to search for in event titles"
+                    "minLength": 1,
+                    "description": "Optional case-insensitive substring to match in event titles."
                   },
                   "limit": {
                     "type": "integer",
-                    "description": "Maximum number of events to return (default: 50)"
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 50,
+                    "description": "Maximum number of matching events to return."
                   },
-                  "fromDate": {
+                  "range_start": {
                     "type": "string",
-                    "description": "Start date for search range in ISO format (default: today)"
+                    "format": "date-time",
+                    "description": "Inclusive range start as an RFC 3339 timestamp. Defaults to the current time."
                   },
-                  "toDate": {
+                  "range_end": {
                     "type": "string",
-                    "description": "End date for search range in ISO format (default: 30 days from now)"
+                    "format": "date-time",
+                    "description": "Range end as an RFC 3339 timestamp. Defaults to seven days after the current time."
                   }
                 },
-                "required": ["searchText"]
+                "required": [],
+                "additionalProperties": false
               },
               "requirements": ["calendar"],
               "permission_policy": "auto"
             },
             {
               "id": "create_event",
-              "description": "Create a new calendar event",
+              "description": "Create an event and return the complete created event. Uses the default calendar unless calendar_name or account_name selects one.",
               "parameters": {
                 "type": "object",
                 "properties": {
                   "title": {
                     "type": "string",
-                    "description": "Title of the event"
+                    "minLength": 1,
+                    "description": "Event title."
                   },
-                  "startDate": {
+                  "start_at": {
                     "type": "string",
-                    "description": "Start date/time in ISO format (e.g., 2024-01-15T09:00:00Z)"
+                    "format": "date-time",
+                    "description": "Event start as an RFC 3339 timestamp."
                   },
-                  "endDate": {
+                  "end_at": {
                     "type": "string",
-                    "description": "End date/time in ISO format (e.g., 2024-01-15T10:00:00Z)"
+                    "format": "date-time",
+                    "description": "Event end as an RFC 3339 timestamp later than start_at."
                   },
                   "location": {
                     "type": "string",
-                    "description": "Location of the event"
+                    "description": "Optional event location."
                   },
                   "notes": {
                     "type": "string",
-                    "description": "Notes/description for the event"
+                    "description": "Optional event notes."
                   },
-                  "isAllDay": {
+                  "is_all_day": {
                     "type": "boolean",
-                    "description": "Whether this is an all-day event (default: false)"
+                    "default": false,
+                    "description": "Whether the event is all-day."
                   },
-                  "calendarName": {
+                  "calendar_name": {
                     "type": "string",
-                    "description": "Name of the calendar to add the event to (default: the system default calendar). If the name exists in multiple accounts, also pass accountName."
+                    "minLength": 1,
+                    "description": "Calendar name. If duplicated across accounts, also provide account_name."
                   },
-                  "accountName": {
+                  "account_name": {
                     "type": "string",
-                    "description": "Account (source) the calendar belongs to, e.g. 'iCloud' or 'Google'. Use list_calendars to see accounts."
+                    "minLength": 1,
+                    "description": "Calendar account name returned by list_calendars."
                   }
                 },
-                "required": ["title", "startDate", "endDate"]
+                "required": ["title", "start_at", "end_at"],
+                "additionalProperties": false
               },
               "requirements": ["calendar"],
               "permission_policy": "ask"
@@ -836,15 +982,17 @@ let calendarManifestJSON = """
               "parameters": {
                 "type": "object",
                 "properties": {
-                  "eventId": {
+                  "event_id": {
                     "type": "string",
-                    "description": "ID of the event to open"
+                    "minLength": 1,
+                    "description": "Stable event ID returned by query_events or create_event."
                   }
                 },
-                "required": ["eventId"]
+                "required": ["event_id"],
+                "additionalProperties": false
               },
               "requirements": ["calendar", "automation"],
-              "permission_policy": "auto"
+              "permission_policy": "ask"
             }
           ]
         }
